@@ -1,40 +1,32 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu-common.h"
 #include "hw/arm/boot.h"
 #include "exec/address-spaces.h"
 #include "hw/arm/ipod_touch.h"
 
+static void ipod_touch_instance_init(Object *obj)
+{
+
+}
+
+// Initialize the iPod Touch machine
 static void ipod_touch_machine_init(MachineState *machine)
 {
-    IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(machine);
+	IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(machine); // Instantiate our state
 
-    /* Initialize a memory region for system RAM */
-    memory_region_init_ram(&nms->sysmem, NULL, "sysmem", 0x10000000, &error_fatal);
-
-    /* Map the RAM into the address space */
-    memory_region_add_subregion(get_system_memory(), 0x00000000, &nms->sysmem);
-
-    /* Initialize and attach the CPU (or multiple CPUs) */
-    ARMCPU **cpu;
-    Object *cpuobj = object_new(machine->cpu_type);
-    *cpu = ARM_CPU(cpuobj);
-    CPUState *cs = CPU(*cpu);
-    nms->cpu = cpu;
-
-    /* Additional CPU configuration can be performed here */
-
-    /* Add additional peripheral initialization here */
+	// initialize our cpu and update our state to use it
+	ARMCPU *cpu;
+	Object *cpuobj = object_new(ARM_CPU_TYPE_NAME("arm1176"));
+	cpu = ARM_CPU(cpuobj);
+	nms->cpu = cpu;
 }
 
 static void ipod_touch_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
-    mc->init = ipod_touch_machine_init;
     mc->desc = "iPod Touch";
-}
-
-static void ipod_touch_instance_init(Object *obj)
-{
+    mc->init = ipod_touch_machine_init;
 }
 
 static const TypeInfo ipod_touch_machine_info = {
@@ -43,7 +35,7 @@ static const TypeInfo ipod_touch_machine_info = {
     .instance_size = sizeof(IPodTouchMachineState),
     .class_size    = sizeof(IPodTouchMachineClass),
     .class_init    = ipod_touch_machine_class_init,
-    .instance_init = ipod_touch_instance_init
+    .instance_init = ipod_touch_instance_init,
 };
 
 static void ipod_touch_machine_types(void)

@@ -14,3 +14,8 @@ It will emulate the 1st-generation iPod Touch. It is heavily based on `devos50`'
 
 	./arm-softmmu/qemu-system-arm -M iPod-Touch -serial mon:stdio -cpu max -m 1G -d unimp
 
+## `pwndbg-lldb` cheatsheet
+
+	pwndbg-lldb path/to/binary
+	run -- arg1 arg2
+	context // redraw screen

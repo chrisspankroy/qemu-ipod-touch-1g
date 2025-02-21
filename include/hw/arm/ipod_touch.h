@@ -1,9 +1,11 @@
 #ifndef HW_ARM_IPOD_TOUCH_H
 #define HW_ARM_IPOD_TOUCH_H
 
+#include "qemu-common.h"
 #include "exec/hwaddr.h"
 #include "hw/boards.h"
 #include "hw/arm/boot.h"
+#include "cpu.h"
 
 #define TYPE_IPOD_TOUCH "iPod-Touch"
 #define TYPE_IPOD_TOUCH_MACHINE MACHINE_TYPE_NAME(TYPE_IPOD_TOUCH)
@@ -15,9 +17,7 @@ typedef struct {
 } IPodTouchMachineClass;
 
 typedef struct {
-    /* Define memory regions, CPU pointers, peripheral state, etc. */
-    MemoryRegion sysmem;
-    CPUState *cpu;
+        ARMCPU *cpu;   // CPU
 } IPodTouchMachineState;
 
 #endif
