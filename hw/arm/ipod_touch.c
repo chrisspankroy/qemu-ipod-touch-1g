@@ -15,11 +15,17 @@ static void ipod_touch_machine_init(MachineState *machine)
 {
 	IPodTouchMachineState *nms = IPOD_TOUCH_MACHINE(machine); // Instantiate our state
 
-	// initialize our cpu and update our state to use it
+	// initialize cpu
 	ARMCPU *cpu;
 	Object *cpuobj = object_new(ARM_CPU_TYPE_NAME("arm1176"));
 	cpu = ARM_CPU(cpuobj);
+	CPUState *cs = CPU(cpu);
 	nms->cpu = cpu;
+
+	// initialize memory
+	MemoryRegion *sysmem = get_system_memory();
+	object_property_set_link(cpuobj, "memory", OBJECT(sysmem), &error_abort); // link our memory to CPU
+	AddressSpace *nsas = cpu_get_address_space(cs, ARMASIdx_NS);; // our address space inside system memory
 }
 
 static void ipod_touch_machine_class_init(ObjectClass *oc, void *data)
