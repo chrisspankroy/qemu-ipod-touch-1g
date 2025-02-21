@@ -549,3 +549,7 @@ config ARMSSE
     select UNIMP
     select SSE_COUNTER
     select SSE_TIMER
+
+config IPOD_TOUCH
+    bool
+    select IPOD_TOUCH
