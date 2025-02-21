@@ -25,7 +25,13 @@ static void ipod_touch_machine_init(MachineState *machine)
 	// initialize memory
 	MemoryRegion *sysmem = get_system_memory();
 	object_property_set_link(cpuobj, "memory", OBJECT(sysmem), &error_abort); // link our memory to CPU
-	AddressSpace *nsas = cpu_get_address_space(cs, ARMASIdx_NS);; // our address space inside system memory
+
+	object_property_set_bool(cpuobj, "realized", true, &error_fatal); // mark CPU as ready
+
+	// reset CPU
+	CPUARMState *env = &cpu->env;
+	cpu_reset(cs);
+	env->pc = 0x13371337;
 }
 
 static void ipod_touch_machine_class_init(ObjectClass *oc, void *data)
@@ -41,7 +47,7 @@ static const TypeInfo ipod_touch_machine_info = {
     .instance_size = sizeof(IPodTouchMachineState),
     .class_size    = sizeof(IPodTouchMachineClass),
     .class_init    = ipod_touch_machine_class_init,
-    .instance_init = ipod_touch_instance_init,
+    .instance_init = ipod_touch_instance_init
 };
 
 static void ipod_touch_machine_types(void)
