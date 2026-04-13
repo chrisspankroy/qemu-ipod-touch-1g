@@ -242,6 +242,9 @@ config SX1
     depends on TCG && ARM
     select OMAP
 
+config S5L8900
+    bool
+
 config VERSATILE
     bool
     default y
