@@ -26,6 +26,80 @@
 #define S5L8900_EVEC_BASE   0x00000000
 #define S5L8900_EVEC_SIZE   0x1000
 
+  /* ---- PL190 VIC stub (0x38e00000, 0x38e01000) ---------------------------
+   * Stores vectored handler addresses written by the ROM and returns them
+   * via VICADDRESS (offset 0xf00) when an IRQ is pending.
+   * ----------------------------------------------------------------------- */
+  #define VIC_VECTADDR_BASE   0x100   /* VICVECTADDR0..31 */
+  #define VIC_VECTADDR_END    0x17c
+  #define VIC_INTENABLE       0x010
+  #define VIC_INTENCLEAR      0x014
+  #define VIC_INTSELECT       0x00c
+  #define VIC_ADDRESS         0xf00
+
+  typedef struct {
+      uint32_t vectaddr[32];  /* programmed ISR addresses */
+      uint32_t intenable;     /* enabled IRQ bitmask */
+      uint32_t pending;       /* asserted IRQ bitmask */
+  } S5L8900VICState;
+
+  static uint64_t s5l8900_vic_read(void *opaque, hwaddr offset, unsigned size)
+  {
+      S5L8900VICState *s = opaque;
+
+      if (offset >= VIC_VECTADDR_BASE && offset <= VIC_VECTADDR_END) {
+          return s->vectaddr[(offset - VIC_VECTADDR_BASE) / 4];
+      }
+      switch (offset) {
+      case 0x000: /* VICIRQSTATUS */
+          return s->pending & s->intenable;
+      case VIC_INTENABLE:
+          return s->intenable;
+      case VIC_ADDRESS:
+          /* Return handler address for lowest pending enabled IRQ */
+          for (int i = 0; i < 32; i++) {
+              if ((s->pending & s->intenable) & (1u << i)) {
+                  return s->vectaddr[i];
+              }
+          }
+          return 0;
+      default:
+          return 0;
+      }
+  }
+
+  static void s5l8900_vic_write(void *opaque, hwaddr offset,
+                                 uint64_t value, unsigned size)
+  {
+      S5L8900VICState *s = opaque;
+
+      if (offset >= VIC_VECTADDR_BASE && offset <= VIC_VECTADDR_END) {
+          s->vectaddr[(offset - VIC_VECTADDR_BASE) / 4] = value;
+          return;
+      }
+      switch (offset) {
+      case VIC_INTENABLE:
+          s->intenable |= value;
+          break;
+      case VIC_INTENCLEAR:
+          s->intenable &= ~value;
+          break;
+      case VIC_INTSELECT:
+          break; /* ignore FIQ/IRQ routing for now */
+      case VIC_ADDRESS:
+          s->pending = 0; /* end-of-interrupt: clear all pending */
+          break;
+      default:
+          break;
+      }
+  }
+
+  static const MemoryRegionOps s5l8900_vic_ops = {
+      .read  = s5l8900_vic_read,
+      .write = s5l8900_vic_write,
+      .endianness = DEVICE_LITTLE_ENDIAN,
+  };
+
 /* ---- CLOCK1 stub (0x3c500000) ------------------------------------------ *
  * The ROM programs the PLL then polls CLOCK1+0x40 waiting for value 1
  * (lock status). Return 1 for all reads to satisfy the lock check.
@@ -47,6 +121,23 @@ static const MemoryRegionOps s5l8900_clock_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* ---- USB stub (0x38c00000) ------------------------------------------ */
+static uint64_t s5l8900_usb_read(void *opaque, hwaddr offset, unsigned size)
+{
+    return 0;
+}
+
+static void s5l8900_usb_write(void *opaque, hwaddr offset,
+                                uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps s5l8900_usb_ops = {
+    .read  = s5l8900_usb_read,
+    .write = s5l8900_usb_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static void s5l8900_cpu_reset(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -60,6 +151,20 @@ static void s5l8900_init(MachineState *machine)
     MemoryRegion *ram  = g_new0(MemoryRegion, 1);
     MemoryRegion *vrom = g_new0(MemoryRegion, 1);
     MemoryRegion *evec = g_new0(MemoryRegion, 1);
+
+    S5L8900VICState *vic0 = g_new0(S5L8900VICState, 1);
+    S5L8900VICState *vic1 = g_new0(S5L8900VICState, 1);
+
+    MemoryRegion *vic0_mr = g_new0(MemoryRegion, 1);
+    MemoryRegion *vic1_mr = g_new0(MemoryRegion, 1);
+
+    memory_region_init_io(vic0_mr, NULL, &s5l8900_vic_ops, vic0,
+                            "s5l8900.vic0", 0x1000);
+    memory_region_add_subregion(sysmem, 0x38e00000, vic0_mr);
+
+    memory_region_init_io(vic1_mr, NULL, &s5l8900_vic_ops, vic1,
+                            "s5l8900.vic1", 0x1000);
+    memory_region_add_subregion(sysmem, 0x38e01000, vic1_mr);
 
     /* ARM1176JZF-S */
     ARMCPU *cpu = ARM_CPU(cpu_create(machine->cpu_type));
@@ -85,11 +190,17 @@ static void s5l8900_init(MachineState *machine)
         load_image_mr(machine->firmware, vrom);
     }
 
-    /* CLOCK1 stub — must be added before the catch-all unimp region */
+    /* CLOCK1 stub */
     MemoryRegion *clock1 = g_new0(MemoryRegion, 1);
     memory_region_init_io(clock1, NULL, &s5l8900_clock_ops, NULL,
                           "s5l8900.clock1", 0x1000);
     memory_region_add_subregion(sysmem, 0x3c500000, clock1);
+
+    /* USB stub */
+    MemoryRegion *usb = g_new0(MemoryRegion, 1);
+    memory_region_init_io(usb, NULL, &s5l8900_usb_ops, NULL,
+                          "s5l8900.usb", 0x1000);
+    memory_region_add_subregion(sysmem, 0x38c00000, usb);
 
     /* Catch and log all peripheral accesses we haven't implemented yet */
     create_unimplemented_device("s5l8900.periph",
