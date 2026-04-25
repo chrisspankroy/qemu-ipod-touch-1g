@@ -61,6 +61,9 @@ static bool aprofile_require_alignment(CPUARMState *env, int el, uint64_t sctlr)
         /* Stage 2 translation enabled: memory type in PTE. */
         return false;
     }
+    if (sctlr & SCTLR_U) {
+        return false;
+    }
     return true;
 #endif
 }

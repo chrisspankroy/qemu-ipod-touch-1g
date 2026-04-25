@@ -1,5 +1,6 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/log.h"
 #include "hw/core/boards.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/core/loader.h"
@@ -7,6 +8,7 @@
 #include "target/arm/cpu.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/memory.h"
 #include "qapi/error.h"
 
 /* From notes.txt memory map */
@@ -64,6 +66,7 @@
           }
           return 0;
       default:
+        qemu_log_mask(LOG_UNIMP, "s5l8900.vic: unimplemented write offset 0x%"HWADDR_PRIx"\n", offset);
           return 0;
       }
   }
@@ -90,6 +93,7 @@
           s->pending = 0; /* end-of-interrupt: clear all pending */
           break;
       default:
+        qemu_log_mask(LOG_UNIMP, "s5l8900.vic: unimplemented write offset 0x%"HWADDR_PRIx"\n", offset);
           break;
       }
   }
@@ -122,19 +126,196 @@ static const MemoryRegionOps s5l8900_clock_ops = {
 };
 
 /* ---- USB stub (0x38c00000) ------------------------------------------ */
+typedef struct {
+    uint32_t gusbcfg; // Global USB Configuration register
+    uint32_t dctl;    // Device control register
+    uint32_t dcfg;    // Device config register
+} S5L8900USBState;
+
+#define DWC2_GOTGINT 0x4
+#define DWC2_GUSBCFG 0x14
+#define DWC2_DCFG    0x800
+#define DWC2_DCTL    0x804
+#define DWC2_GRSTCTL 0x10
+#define DWC2_DSTS 0x808
+
 static uint64_t s5l8900_usb_read(void *opaque, hwaddr offset, unsigned size)
 {
-    return 0;
+    S5L8900USBState *s = opaque;
+    switch (offset) {
+        case DWC2_GUSBCFG:
+            return s->gusbcfg;
+        case DWC2_DCFG:
+            return s->dcfg;
+        case DWC2_DCTL:
+            return s->dctl;
+        case DWC2_GRSTCTL:
+            return 1u << 31; // set bit 31, rest are unset
+        case DWC2_DSTS:
+            return 1u << 1; // set bit 1, rest are unset
+        default:
+            qemu_log_mask(LOG_UNIMP, "s5l8900.usb: unimplemented read offset 0x%"HWADDR_PRIx"\n", offset);
+            return 0;
+    }
 }
 
 static void s5l8900_usb_write(void *opaque, hwaddr offset,
                                 uint64_t value, unsigned size)
 {
+    S5L8900USBState *s = opaque;
+
+    switch (offset) {
+        case DWC2_GUSBCFG:
+            s->gusbcfg = value;
+            break;
+        case DWC2_DCFG:
+            s->dcfg = value;
+            break;
+        case DWC2_DCTL:
+            s->dctl = value;
+            break;
+        case DWC2_GOTGINT:
+            uint32_t usb_struct_ptr;
+            cpu_physical_memory_read(0x200031c0, &usb_struct_ptr, 4);
+            uint32_t usb_struct;
+            cpu_physical_memory_read(usb_struct_ptr, &usb_struct, 4);
+            uint32_t write_value = 1;
+            cpu_physical_memory_write(usb_struct + 0x98, &write_value, 4);
+            cpu_physical_memory_write(usb_struct + 0xa0, &write_value, 4);
+            break; 
+        default:
+            qemu_log_mask(LOG_UNIMP, "s5l8900.usb: unimplemented write offset 0x%"HWADDR_PRIx"\n", offset);
+            break;
+    }
 }
 
 static const MemoryRegionOps s5l8900_usb_ops = {
     .read  = s5l8900_usb_read,
     .write = s5l8900_usb_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+typedef struct {
+  uint32_t ctrl;
+  uint32_t destaddr;
+  uint32_t copysize;
+  uint8_t fifo[8];
+  uint32_t unknown[5];
+} S5L8900DMAState;
+
+#define DMA_CTRL    0x0
+#define DMA_UNKNOWN 0x20
+#define DMA_FIFO 0x40
+#define DMA_DESTADDR   0x84
+#define DMA_COPYSIZE    0x8c
+
+static uint64_t s5l8900_dma_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8900DMAState *s = opaque;
+    switch (offset) {
+        case DMA_CTRL:
+            return s->ctrl;
+        case DMA_DESTADDR:
+            return s->destaddr;
+        case DMA_COPYSIZE:
+            return s->copysize;
+        case DMA_FIFO:
+            return s->fifo[0] | (s->fifo[1] << 8) | (s->fifo[2] << 16) | (s->fifo[3] << 24);
+        case DMA_FIFO + 0x4:
+            return s->fifo[4] | (s->fifo[5] << 8) | (s->fifo[6] << 16) | (s->fifo[7] << 24);
+        case DMA_UNKNOWN:
+            return s->unknown[0];
+        case DMA_UNKNOWN + 0x4:
+            return s->unknown[1];
+        case DMA_UNKNOWN + 0x8:
+            return s->unknown[2];
+        case DMA_UNKNOWN + 0xc:
+            return s->unknown[3];
+        case DMA_UNKNOWN + 0x10:
+            return s->unknown[4];
+        default:
+            qemu_log_mask(LOG_UNIMP, "s5l8900.dma: unimplemented read offset 0x%"HWADDR_PRIx"\n", offset);
+            return 0;
+    }
+}
+
+#define DMA_CTRL_START  (1u << 1 | 1u << 2)
+#define DMA_XFR_DIR (1u << 3) 
+
+static void s5l8900_dma_write(void *opaque, hwaddr offset,
+                                uint64_t value, unsigned size)
+{
+    S5L8900DMAState *s = opaque;
+    switch (offset) {
+        case DMA_CTRL:
+            s->ctrl = value;
+            // If bits 1 and 2 are set (start transfer)
+            if ((value & DMA_CTRL_START) == DMA_CTRL_START) {
+
+                uint32_t usb_struct_ptr;
+                cpu_physical_memory_read(0x200031c0, &usb_struct_ptr, 4);
+                uint32_t usb_struct;
+                cpu_physical_memory_read(usb_struct_ptr, &usb_struct, 4);
+
+                if ((value & DMA_XFR_DIR) == DMA_XFR_DIR) {
+                    // TX (device to host)
+                    qemu_log_mask(LOG_UNIMP, "s5l8900.dma: TX transfer kicked dest=0x%x size=0x%x\n", s->destaddr, s->copysize);
+                }
+                else {
+                    // RX (host to device)
+                    qemu_log_mask(LOG_UNIMP, "s5l8900.dma: RX transfer kicked dest=0x%x size=0x%x\n", s->destaddr, s->copysize);
+                    uint32_t word1 = 0x121;
+                    uint32_t word2 = 0x400000;
+                    // Write our SETUP packet to RAM
+                    cpu_physical_memory_write(s->destaddr, &word1, 4);
+                    cpu_physical_memory_write(s->destaddr + 0x4, &word2, 4);
+                    // Write our SETUP packet to DMA FIFO
+                    s->fifo[0] = 0x21;
+                    s->fifo[1] = 0x01;
+                    s->fifo[2] = 0x00;
+                    s->fifo[3] = 0x00;
+                    s->fifo[4] = 0x00;
+                    s->fifo[5] = 0x00;
+                    s->fifo[6] = 0x40;
+                    s->fifo[7] = 0x00;
+                }
+                // Signal completion
+                uint32_t write_value = 1;
+                cpu_physical_memory_write(usb_struct + 0x98, &write_value, 4);
+                cpu_physical_memory_write(usb_struct + 0xa0, &write_value, 4);
+                s->ctrl = 0;
+            }
+            break;
+        case DMA_DESTADDR:
+            s->destaddr = value;
+            break;
+        case DMA_COPYSIZE:
+            s->copysize = value;
+            break;
+        case DMA_UNKNOWN:
+            s->unknown[0] = value;
+            break;
+        case DMA_UNKNOWN + 0x4:
+            s->unknown[1] = value;
+            break;
+        case DMA_UNKNOWN + 0x8:
+            s->unknown[2] = value;
+            break;
+        case DMA_UNKNOWN + 0xc:
+            s->unknown[3] = value;
+            break;
+        case DMA_UNKNOWN + 0x10:
+            s->unknown[4] = value;
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "s5l8900.dma: unimplemented write offset 0x%"HWADDR_PRIx"\n", offset);
+            break;
+    }
+}
+
+static const MemoryRegionOps s5l8900_dma_ops = {
+    .read  = s5l8900_dma_read,
+    .write = s5l8900_dma_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
@@ -151,6 +332,7 @@ static void s5l8900_init(MachineState *machine)
     MemoryRegion *ram  = g_new0(MemoryRegion, 1);
     MemoryRegion *vrom = g_new0(MemoryRegion, 1);
     MemoryRegion *evec = g_new0(MemoryRegion, 1);
+    MemoryRegion *unknown = g_new0(MemoryRegion, 1);
 
     S5L8900VICState *vic0 = g_new0(S5L8900VICState, 1);
     S5L8900VICState *vic1 = g_new0(S5L8900VICState, 1);
@@ -181,6 +363,11 @@ static void s5l8900_init(MachineState *machine)
                            S5L8900_RAM_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, S5L8900_RAM_BASE, ram);
 
+    /* Unknown region */
+    memory_region_init_ram(unknown, NULL, "s5l8900.unknownregion",
+                           0x10000, &error_fatal);
+    memory_region_add_subregion(sysmem, 0x24000000, unknown);
+
     /* SecureROM */
     memory_region_init_rom(vrom, NULL, "s5l8900.vrom",
                            S5L8900_VROM_SIZE, &error_fatal);
@@ -190,6 +377,11 @@ static void s5l8900_init(MachineState *machine)
         load_image_mr(machine->firmware, vrom);
     }
 
+    // Alias ROM to 0x0
+    MemoryRegion *vrom_alias = g_new0(MemoryRegion, 1);
+    memory_region_init_alias(vrom_alias, NULL, "s5l8900.vromalias", vrom, 0x0, S5L8900_VROM_SIZE);
+    memory_region_add_subregion(sysmem, 0x0, vrom_alias);
+
     /* CLOCK1 stub */
     MemoryRegion *clock1 = g_new0(MemoryRegion, 1);
     memory_region_init_io(clock1, NULL, &s5l8900_clock_ops, NULL,
@@ -197,10 +389,18 @@ static void s5l8900_init(MachineState *machine)
     memory_region_add_subregion(sysmem, 0x3c500000, clock1);
 
     /* USB stub */
+    S5L8900USBState *usb_state = g_new0(S5L8900USBState, 1);
     MemoryRegion *usb = g_new0(MemoryRegion, 1);
-    memory_region_init_io(usb, NULL, &s5l8900_usb_ops, NULL,
+    memory_region_init_io(usb, NULL, &s5l8900_usb_ops, usb_state,
                           "s5l8900.usb", 0x1000);
     memory_region_add_subregion(sysmem, 0x38c00000, usb);
+
+    /* DMA stub */
+    S5L8900DMAState *dma_state = g_new0(S5L8900DMAState, 1);
+    MemoryRegion *dma = g_new0(MemoryRegion, 1);
+    memory_region_init_io(dma, NULL, &s5l8900_dma_ops, dma_state,
+                           "s5l8900.dma", 0x100);
+    memory_region_add_subregion(sysmem, 0x38000000, dma);
 
     /* Catch and log all peripheral accesses we haven't implemented yet */
     create_unimplemented_device("s5l8900.periph",
