@@ -1,6 +1,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "hw/core/boards.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/core/loader.h"
@@ -10,6 +11,7 @@
 #include "system/reset.h"
 #include "system/memory.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 
 /* From notes.txt memory map */
 #define S5L8900_VROM_BASE   0x20000000
@@ -54,13 +56,13 @@
       }
       switch (offset) {
       case 0x000: /* VICIRQSTATUS */
-          return s->pending & s->intenable;
+          return s->pending;
       case VIC_INTENABLE:
           return s->intenable;
       case VIC_ADDRESS:
           /* Return handler address for lowest pending enabled IRQ */
           for (int i = 0; i < 32; i++) {
-              if ((s->pending & s->intenable) & (1u << i)) {
+              if (s->pending & (1u << i)) {
                   return s->vectaddr[i];
               }
           }
@@ -91,6 +93,7 @@
           break; /* ignore FIQ/IRQ routing for now */
       case VIC_ADDRESS:
           s->pending = 0; /* end-of-interrupt: clear all pending */
+          cpu_reset_interrupt(qemu_get_cpu(0), CPU_INTERRUPT_HARD);
           break;
       default:
         qemu_log_mask(LOG_UNIMP, "s5l8900.vic: unimplemented write offset 0x%"HWADDR_PRIx"\n", offset);
@@ -196,11 +199,18 @@ static const MemoryRegionOps s5l8900_usb_ops = {
 };
 
 typedef struct {
+  uint32_t irq_pending;
+} S5L8900USBCTRLState;
+
+typedef struct {
   uint32_t ctrl;
   uint32_t destaddr;
   uint32_t copysize;
   uint8_t fifo[8];
   uint32_t unknown[5];
+  S5L8900VICState *vic0;
+  S5L8900USBCTRLState *usbctrl;
+  QEMUTimer *deferred_irq;
 } S5L8900DMAState;
 
 #define DMA_CTRL    0x0
@@ -241,6 +251,36 @@ static uint64_t s5l8900_dma_read(void *opaque, hwaddr offset, unsigned size)
 
 #define DMA_CTRL_START  (1u << 1 | 1u << 2)
 #define DMA_XFR_DIR (1u << 3) 
+
+static void s5l8900_deferred_irq_cb(void *opaque)
+{
+    S5L8900DMAState *s = opaque;
+    uint32_t usb_struct_ptr, usb_struct;
+    cpu_physical_memory_read(0x200031c0, &usb_struct_ptr, 4);
+    cpu_physical_memory_read(usb_struct_ptr, &usb_struct, 4);
+    uint8_t usb_state = 4;
+    cpu_physical_memory_write(usb_struct + 0x50, &usb_state, 1);
+    uint32_t ev8 = 8;
+    cpu_physical_memory_write(usb_struct + 0x100, &ev8, 4);
+
+    /* Simulate completed DFU DNLOAD: set download-complete flag and sub-struct flag
+     * so the DFU main loop (0x20003a00) proceeds to call the image booter. */
+    uint32_t sub_ptr = 0;
+    cpu_physical_memory_read(usb_struct + 0x8ec, &sub_ptr, 4);
+    if (sub_ptr) {
+        uint8_t flag1 = 1;
+        cpu_physical_memory_write(sub_ptr + 0x36, &flag1, 1);
+        qemu_log_mask(LOG_UNIMP, "s5l8900.dma: wrote sub_ptr+0x36=1 (sub_ptr=0x%x)\n", sub_ptr);
+    }
+    uint32_t dnload_done = 0x40; /* 64-byte block done */
+    cpu_physical_memory_write(usb_struct + 0x2c, &dnload_done, 4);
+
+    qemu_log_mask(LOG_UNIMP, "s5l8900.dma: deferred IRQ fired usb_struct=0x%x +0x50=4 +0x100=8 +0x2c=0x40 sub_ptr=0x%x\n", usb_struct, sub_ptr);
+    s->usbctrl->irq_pending = 1;
+    s->vic0->pending |= 1;
+    s->vic0->vectaddr[0] = 0x200077a4;
+    cpu_interrupt(qemu_get_cpu(0), CPU_INTERRUPT_HARD);
+}
 
 static void s5l8900_dma_write(void *opaque, hwaddr offset,
                                 uint64_t value, unsigned size)
@@ -284,6 +324,10 @@ static void s5l8900_dma_write(void *opaque, hwaddr offset,
                 cpu_physical_memory_write(usb_struct + 0x98, &write_value, 4);
                 cpu_physical_memory_write(usb_struct + 0xa0, &write_value, 4);
                 s->ctrl = 0;
+
+                // Defer IRQ until after USB init (0x200043b4) has completed
+                timer_mod(s->deferred_irq,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5000000);
             }
             break;
         case DMA_DESTADDR:
@@ -319,6 +363,51 @@ static const MemoryRegionOps s5l8900_dma_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static uint64_t s5l8900_usbctrl_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8900USBCTRLState *s = opaque;
+    switch (offset) {
+        case 0x14:
+            if (s->irq_pending) {
+                return 0x90080005;
+            }
+            else {
+                return 1;
+            }
+        case 0x818:
+            if (s->irq_pending) {
+                return 0x10000;
+            }
+            else {
+                return 0;
+            }
+        case 0xb08:
+            return 0xffffffff;
+        case 0x0:
+            return s->irq_pending ? 0x10000 : 0;
+        default:
+            return 0;
+    }
+}
+
+static void s5l8900_usbctrl_write(void *opaque, hwaddr offset,
+                                uint64_t value, unsigned size)
+{
+    (void)opaque;
+    switch (offset) {
+        case 0x14:
+            break;
+        default:
+            break;
+    }
+}
+
+static const MemoryRegionOps s5l8900_usbctrl_ops = {
+    .read  = s5l8900_usbctrl_read,
+    .write = s5l8900_usbctrl_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 static void s5l8900_cpu_reset(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -338,6 +427,8 @@ static void s5l8900_init(MachineState *machine)
     S5L8900VICState *vic1 = g_new0(S5L8900VICState, 1);
 
     MemoryRegion *vic0_mr = g_new0(MemoryRegion, 1);
+    vic0->vectaddr[0] = 0x200077a4;
+
     MemoryRegion *vic1_mr = g_new0(MemoryRegion, 1);
 
     memory_region_init_io(vic0_mr, NULL, &s5l8900_vic_ops, vic0,
@@ -377,6 +468,34 @@ static void s5l8900_init(MachineState *machine)
         load_image_mr(machine->firmware, vrom);
     }
 
+    if (machine->kernel_filename) {
+        /* Load img2 payload into SRAM: skip 0x800-byte header, code follows */
+        #define IMG2_HDR_SIZE 0x800
+        gsize img_size;
+        guint8 *img_data = NULL;
+        GError *gerr = NULL;
+        if (g_file_get_contents(machine->kernel_filename,
+                                (gchar **)&img_data, &img_size, &gerr)) {
+            if (img_size > IMG2_HDR_SIZE) {
+                cpu_physical_memory_write(S5L8900_RAM_BASE,
+                                          img_data + IMG2_HDR_SIZE,
+                                          img_size - IMG2_HDR_SIZE);
+                qemu_log_mask(LOG_UNIMP,
+                    "s5l8900: loaded %s (%zu bytes) at 0x%x "
+                    "(skipped 0x%x img2 header)\n",
+                    machine->kernel_filename,
+                    img_size - IMG2_HDR_SIZE,
+                    S5L8900_RAM_BASE, IMG2_HDR_SIZE);
+            } else {
+                error_report("s5l8900: firmware too small: %zu bytes", img_size);
+            }
+            g_free(img_data);
+        } else {
+            error_report("s5l8900: failed to load firmware: %s", gerr->message);
+            g_error_free(gerr);
+        }
+    }
+
     // Alias ROM to 0x0
     MemoryRegion *vrom_alias = g_new0(MemoryRegion, 1);
     memory_region_init_alias(vrom_alias, NULL, "s5l8900.vromalias", vrom, 0x0, S5L8900_VROM_SIZE);
@@ -401,6 +520,18 @@ static void s5l8900_init(MachineState *machine)
     memory_region_init_io(dma, NULL, &s5l8900_dma_ops, dma_state,
                            "s5l8900.dma", 0x100);
     memory_region_add_subregion(sysmem, 0x38000000, dma);
+
+    /* USB CTRL stub */
+    S5L8900USBCTRLState *usbctrl_state = g_new0(S5L8900USBCTRLState, 1);
+    MemoryRegion *usbctrl = g_new0(MemoryRegion, 1);
+    memory_region_init_io(usbctrl, NULL, &s5l8900_usbctrl_ops, usbctrl_state,
+                           "s5l8900.usbctrl", 0x10000);
+    memory_region_add_subregion(sysmem, 0x38400000, usbctrl);
+
+    dma_state->vic0 = vic0;
+    dma_state->usbctrl = usbctrl_state;
+    dma_state->deferred_irq = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                           s5l8900_deferred_irq_cb, dma_state);
 
     /* Catch and log all peripheral accesses we haven't implemented yet */
     create_unimplemented_device("s5l8900.periph",
