@@ -25,7 +25,6 @@
 #include "hw/core/registerfields.h"
 #include "cpu-qom.h"
 #include "exec/cpu-common.h"
-#include "exec/cpu-defs.h"
 #include "exec/cpu-interrupt.h"
 #include "exec/gdbstub.h"
 #include "exec/page-protection.h"
@@ -1080,7 +1079,8 @@ struct ArchCPU {
      * Note that if you add an ID register to the ARMISARegisters struct
      * you need to also update the 32-bit and 64-bit versions of the
      * kvm_arm_get_host_cpu_features() function to correctly populate the
-     * field by reading the value from the KVM vCPU.
+     * field by reading the value from the KVM vCPU. If it is an AArch64
+     * ID register then you also must update arm_clear_aarch64_idregs().
      */
     struct ARMISARegisters {
         uint32_t mvfr0;
@@ -1139,6 +1139,7 @@ struct ArchCPU {
 
     QLIST_HEAD(, ARMELChangeHook) pre_el_change_hooks;
     QLIST_HEAD(, ARMELChangeHook) el_change_hooks;
+    QLIST_HEAD(, ARMCPRegMigTolerance) cpreg_mig_tolerances;
 
     int32_t node_id; /* NUMA node this CPU belongs to */
 
@@ -2089,6 +2090,11 @@ FIELD(GPCCR, TBGPCD, 18, 1)
 FIELD(GPCCR, NSO, 19, 1)
 FIELD(GPCCR, L0GPTSZ, 20, 4)
 FIELD(GPCCR, APPSAA, 24, 1)
+FIELD(GPCCR, SA, 25, 1)
+FIELD(GPCCR, NSP, 26, 1)
+FIELD(GPCCR, NA6, 27, 1)
+FIELD(GPCCR, NA7, 28, 1)
+FIELD(GPCCR, GPCBW, 29, 1)
 
 FIELD(MFAR, FPA, 12, 40)
 FIELD(MFAR, NSE, 62, 1)

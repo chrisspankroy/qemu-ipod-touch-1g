@@ -41,6 +41,7 @@
 #include "system/kvm.h"
 #include "hw/intc/arm_gicv3_common.h"
 #include "qom/object.h"
+#include "hw/core/cpu.h"
 
 #define NUM_GICV2M_SPIS       64
 #define NUM_VIRTIO_TRANSPORTS 32
@@ -51,6 +52,8 @@
 
 /* GPIO pins */
 #define GPIO_PIN_POWER_BUTTON  3
+
+#define CPU_MAX_CACHES 16
 
 enum {
     VIRT_FLASH,
@@ -135,6 +138,8 @@ struct VirtMachineClass {
     bool no_tcg_lpa2;
     bool no_ns_el2_virt_timer_irq;
     bool no_nested_smmu;
+    /* HVF specific: support for kernel-irqchip=on introduced in QEMU 11.1 */
+    bool hvf_no_kernel_irqchip_default;
 };
 
 struct VirtMachineState {
@@ -195,7 +200,19 @@ struct VirtMachineState {
 OBJECT_DECLARE_TYPE(VirtMachineState, VirtMachineClass, VIRT_MACHINE)
 
 void virt_acpi_setup(VirtMachineState *vms);
-bool virt_is_acpi_enabled(VirtMachineState *vms);
+bool virt_is_acpi_enabled(const VirtMachineState *vms);
+
+#define CLIDR_CTYPE_NO_CACHE 0x00
+#define CLIDR_CTYPE_I_CACHE 0x01
+#define CLIDR_CTYPE_D_CACHE 0x02
+#define CLIDR_CTYPE_SEPARATE_I_D_CACHES 0x03
+#define CLIDR_CTYPE_UNIFIED_CACHE 0x04
+#define CLIDR_CTYPE_MAX_CACHE_LEVEL 7
+
+unsigned int virt_get_caches(const VirtMachineState *vms,
+                             CPUCoreCaches *caches);
+void set_cpu_cache(CPUCoreCaches *cpu_cache, enum CacheType cache_type,
+                   int cache_level, bool is_i_cache);
 
 /* Return number of redistributors that fit in the specified region */
 static uint32_t virt_redist_capacity(VirtMachineState *vms, int region)

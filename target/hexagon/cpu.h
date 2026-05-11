@@ -22,10 +22,11 @@
 
 #include "cpu-qom.h"
 #include "exec/cpu-common.h"
-#include "exec/cpu-defs.h"
+#include "exec/target_long.h"
 #include "hex_regs.h"
 #include "mmvec/mmvec.h"
 #include "hw/core/registerfields.h"
+#include "qemu/bitmap.h"
 
 #ifndef CONFIG_USER_ONLY
 #error "Hexagon does not support system emulation"
@@ -117,6 +118,8 @@ typedef struct HexagonCPUClass {
 
     DeviceRealize parent_realize;
     ResettablePhases parent_phases;
+
+    const HexagonCPUDef *hex_def;
 } HexagonCPUClass;
 
 struct ArchCPU {

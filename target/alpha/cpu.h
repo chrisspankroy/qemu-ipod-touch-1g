@@ -22,7 +22,6 @@
 
 #include "cpu-qom.h"
 #include "exec/cpu-common.h"
-#include "exec/cpu-defs.h"
 #include "exec/cpu-interrupt.h"
 #include "qemu/cpu-float.h"
 
@@ -311,9 +310,9 @@ enum {
 };
 
 /* Alpha-specific interrupt pending bits.  */
-#define CPU_INTERRUPT_TIMER	CPU_INTERRUPT_TGT_EXT_0
-#define CPU_INTERRUPT_SMP	CPU_INTERRUPT_TGT_EXT_1
-#define CPU_INTERRUPT_MCHK	CPU_INTERRUPT_TGT_EXT_2
+#define CPU_INTERRUPT_TIMER     CPU_INTERRUPT_TGT_EXT_0
+#define CPU_INTERRUPT_SMP       CPU_INTERRUPT_TGT_EXT_1
+#define CPU_INTERRUPT_MCHK      CPU_INTERRUPT_TGT_EXT_2
 
 /* OSF/1 Page table bits.  */
 enum {

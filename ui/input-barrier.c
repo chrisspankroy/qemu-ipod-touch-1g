@@ -518,11 +518,7 @@ static void input_barrier_complete(UserCreatable *uc, Error **errp)
 static void input_barrier_instance_finalize(Object *obj)
 {
     InputBarrier *ib = INPUT_BARRIER(obj);
-
-    if (ib->ioc_tag) {
-        g_source_remove(ib->ioc_tag);
-        ib->ioc_tag = 0;
-    }
+    g_clear_handle_id(&ib->ioc_tag, g_source_remove);
 
     if (ib->sioc) {
         qio_channel_close(QIO_CHANNEL(ib->sioc), NULL);
@@ -679,8 +675,8 @@ static void input_barrier_instance_init(Object *obj)
     /* always use generic keymaps */
     if (keyboard_layout && !kbd_layout) {
         /* We use X11 key id, so use VNC name2keysym */
-        kbd_layout = init_keyboard_layout(name2keysym, keyboard_layout,
-                                          &error_fatal);
+        kbd_layout = kbd_layout_new(name2keysym, keyboard_layout,
+                                    &error_fatal);
     }
 
     ib->saddr.type = SOCKET_ADDRESS_TYPE_INET;
