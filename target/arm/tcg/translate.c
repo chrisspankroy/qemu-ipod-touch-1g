@@ -6636,7 +6636,12 @@ static void thumb_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     uint32_t insn_eci_pc_save = -1;
 
     /* Misaligned thumb PC is architecturally impossible. */
-    assert((dc->base.pc_next & 1) == 0);
+    if ((dc->base.pc_next & 1) != 0) {
+        /* Fixup: strip LSB and continue. This can happen when the CPU
+         * is redirected externally (e.g., from a device model callback). */
+        dc->base.pc_next &= ~1;
+        pc = dc->base.pc_next;
+    }
 
     if (arm_check_ss_active(dc) || arm_check_kernelpage(dc)) {
         dc->base.pc_next = pc + 2;
