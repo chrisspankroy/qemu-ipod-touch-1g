@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "jobs": [
+    {
+      "id": "mp0nu9ek-d4078c",
+      "name": "default",
+      "action": "continue from work/progress.md and implement the next unfinished TODO",
+      "intervalMs": 0,
+      "immediate": true,
+      "maxRuns": 0,
+      "maxRuntimeMs": 0,
+      "maxFailures": 0,
+      "timeoutMs": 0,
+      "includeFiles": [],
+      "watchPaths": [],
+      "compactEveryRuns": 0,
+      "compactEveryMs": 0,
+      "branchDone": false,
+      "noOverlap": true,
+      "safe": false,
+      "quiet": false,
+      "askNever": false,
+      "pauseOnVerifyFail": false,
+      "gitCheckpoint": false,
+      "checkpointOnly": false,
+      "dryRun": false,
+      "multi": false,
+      "batch": 0,
+      "runCount": 0,
+      "failureCount": 0,
+      "lastRunAt": 0,
+      "lastCompactAt": 0,
+      "lastCompactRunCount": 0,
+      "watchSnapshot": {},
+      "createdAt": "2026-05-11T03:46:51.548Z",
+      "enabled": true,
+      "paused": false
+    }
+  ]
+}

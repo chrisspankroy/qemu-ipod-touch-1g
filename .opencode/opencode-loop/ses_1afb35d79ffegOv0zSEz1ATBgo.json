@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "jobs": [
+    {
+      "id": "mph2pvoi-625f04",
+      "name": "default",
+      "action": "read your progress from work/progress.md and continue working until you reach the end goal",
+      "intervalMs": 0,
+      "immediate": true,
+      "maxRuns": 0,
+      "maxRuntimeMs": 0,
+      "maxFailures": 0,
+      "timeoutMs": 0,
+      "includeFiles": [],
+      "watchPaths": [],
+      "compactEveryRuns": 0,
+      "compactEveryMs": 0,
+      "branchDone": false,
+      "noOverlap": true,
+      "safe": false,
+      "quiet": false,
+      "askNever": false,
+      "pauseOnVerifyFail": false,
+      "gitCheckpoint": false,
+      "checkpointOnly": false,
+      "dryRun": false,
+      "multi": false,
+      "batch": 0,
+      "runCount": 9,
+      "failureCount": 0,
+      "lastRunAt": 1779481366273,
+      "lastCompactAt": 0,
+      "lastCompactRunCount": 0,
+      "watchSnapshot": {},
+      "createdAt": "2026-05-22T15:27:40.194Z",
+      "enabled": true,
+      "paused": false
+    }
+  ]
+}

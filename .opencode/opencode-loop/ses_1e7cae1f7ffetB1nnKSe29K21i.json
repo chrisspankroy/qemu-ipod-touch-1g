@@ -1,0 +1,40 @@
+{
+  "version": 3,
+  "jobs": [
+    {
+      "id": "mp1ifl0a-5a405b",
+      "name": "default",
+      "action": "Read your progress from work/progress.md and implement the next TODO",
+      "intervalMs": 0,
+      "immediate": true,
+      "maxRuns": 0,
+      "maxRuntimeMs": 0,
+      "maxFailures": 0,
+      "timeoutMs": 0,
+      "includeFiles": [],
+      "watchPaths": [],
+      "compactEveryRuns": 0,
+      "compactEveryMs": 0,
+      "branchDone": false,
+      "noOverlap": true,
+      "safe": false,
+      "quiet": false,
+      "askNever": false,
+      "pauseOnVerifyFail": false,
+      "gitCheckpoint": false,
+      "checkpointOnly": false,
+      "dryRun": false,
+      "multi": false,
+      "batch": 0,
+      "runCount": 7,
+      "failureCount": 0,
+      "lastRunAt": 1778530179319,
+      "lastCompactAt": 0,
+      "lastCompactRunCount": 0,
+      "watchSnapshot": {},
+      "createdAt": "2026-05-11T18:03:14.842Z",
+      "enabled": true,
+      "paused": false
+    }
+  ]
+}

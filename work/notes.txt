@@ -1,0 +1,27 @@
+iPod Touch (1st-generation)
+n45ap
+
+You have a 8GB model. Uses 2 NAND chips of 4GB each
+
+Supports iOS 1.1-3.1.3
+
+S5L8900
+CPU datasheet: https://developer.arm.com/documentation/ddi0301/h/
+
+No SHSH blobs or downgrade protection
+
+Peripheral port at 0x38000000 (this is where all the peripheral memory ranges fall into)
+
+Memory map:
+SecureROM (VROM): 0x20000000-0x20010000
+CLOCK0: 0x38100000
+VIC0: 0x38e00000-0x38e00fff
+VIC1: 0x38e01000-0x38e01fff
+EDGEIC: 0x38e02000
+GPIOIC: 0x39a00000
+CLOCK1: 0x3c500000
+WDT_CTRL: 0x3e300000
+
+DFU mode is in the SecureROM
+
+SecureROM dumps at securerom.fun
