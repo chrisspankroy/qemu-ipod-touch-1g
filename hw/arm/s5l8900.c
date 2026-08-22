@@ -57,6 +57,14 @@
  * in the jump callback after iBEC is done. */
 #define S5L8900_IBOOT_RUNTIME 0x18000000
 
+/* Path A: iBoot.decrypted is an img2 container = 0x400-byte header + 0x22000-byte
+ * payload. The payload is linked at 0x18000000. We load ONLY the payload at the
+ * runtime/staging base so iBoot runs at its true link address and every absolute
+ * pointer is correct without per-literal surgery. File offset F (>= IBOOT_HDR) of
+ * the payload lives at base + (F - IBOOT_HDR). */
+#define S5L8900_IBOOT_HDR     0x400
+#define S5L8900_IBOOT_PAYLOAD 0x22000
+
 /* Safe loop address in SRAM for exception vector redirects */
 #define S5L8900_SAFELOOP_ADDR (S5L8900_RAM_BASE + 0xFE00)
 
@@ -99,19 +107,6 @@
   static int s5l8900_ibec_init_patched = 0;  /* iBEC entry BLs patched flag */
   static int s5l8900_iboot_launched = 0;     /* set when jump callback launches iBoot */
   static uint32_t s5l8900_last_valid_rt_pc = 0;  /* last valid PC in iBoot runtime region */
-
- /* CLEAN BASELINE: when S5L8900_IBSS_CLEAN is set, DO NOT apply any brute-force
-  * iBSS code patches (fills, skip-loops, stubs, pointer fixes, exception-handler
-  * redirects). iBSS is loaded and run as the real image so we can observe its
-  * genuine first fault / missing-hardware need. */
- static int s5l8900_ibss_clean(void)
- {
-     static int clean = -1;
-     if (clean < 0) {
-         clean = (getenv("S5L8900_IBSS_CLEAN") != NULL) ? 1 : 0;
-     }
-     return clean;
- }
 
   /* ---- PL190 VIC stub (0x38e00000, 0x38e01000) ---------------------------
    * Stores vectored handler addresses written by the ROM and returns them
@@ -233,89 +228,6 @@ static uint64_t s5l8900_clock_read(void *opaque, hwaddr offset, unsigned size)
             }
         }
 
-        /* Apply iBSS runtime patches to RAM_BASE after self-copy.
-          * The self-copy from 0x09000000 may not propagate our IBSS patches
-          * (IMG2 section-based copy, not raw memcpy). Apply directly to RAM.
-          * Use ARM-mode instructions for entries (0x4ea0, 0x5400) since callers
-          * may execute in ARM mode. Use Thumb NOPs for the BL callers. */
-         {
-              static int clock_runtime_patched = 0;
-              static int clock_clean_logged = 0;
-              if (s5l8900_ibss_clean()) {
-                  if (!clock_clean_logged) { clock_clean_logged = 1; fprintf(stderr, "CLOCK1: CLEAN BASELINE - skipping iBSS runtime patches\n"); }
-              } else if (!clock_runtime_patched) {
-                  clock_runtime_patched = 1;
-                  /* Patch 0x3c00-0x4fff with ARM-mode instructions.
-                     * CRITICAL: Thumb bytes in this region decode as ARM LDR/STR that
-                     * read data and use it as jump targets. Fill entire region
-                     * with ARM MOV r0,#1; BX LR.
-                     * EXPERIMENT: gate behind S5L8900_IBSS_FILL_3C00 (default SKIP)
-                     * so the real iBSS Thumb code in this region is preserved. */
-                    if (getenv("S5L8900_IBSS_FILL_3C00")) {
-                        uint32_t arm_ret[] = { 0xE3A00001, 0xE12FFF1E };
-                        size_t region_size = 0x4400 - 0x3c00;
-                        uint8_t *safe_region = g_malloc(region_size);
-                        for (size_t i = 0; i < region_size; i += 8) {
-                            memcpy(safe_region + i, arm_ret, sizeof(arm_ret));
-                        }
-                        cpu_physical_memory_write(S5L8900_RAM_BASE + 0x3c00,
-                                                  safe_region, region_size);
-                        g_free(safe_region);
-                        fprintf(stderr, "CLOCK1: patched 0x3c00-0x4fff -> ARM MOV r0,#1/BX LR (%zu bytes)\n", region_size);
-                    } else {
-                        fprintf(stderr, "CLOCK1: SKIPPED 0x3c00-0x4fff fill (S5L8900_IBSS_FILL_3C00 unset; real iBSS code preserved)\n");
-                    }
-
-                  /* Patch 0x5400 entry: Thumb MOV r0,#0; BX LR */
-                  {
-                      uint8_t ret_0_thumb[] = { 0x00, 0x20, 0x70, 0x47 };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0x5400,
-                                                ret_0_thumb, sizeof(ret_0_thumb));
-                  }
-
-                  /* Write safe function pointer to 0x22012ccc.
-                   * This is the data that r0 points to when the bad function runs.
-                   * Point it to our safe loop at 0x4ea0 so any indirect jumps
-                   * land on safe code instead of garbage addresses. */
-                  {
-                      uint32_t safe_ptr = S5L8900_RAM_BASE + 0x4ea0;
-                      cpu_physical_memory_write(0x22012ccc, &safe_ptr, 4);
-                      /* Also fix nearby pointers */
-                      for (int p = -0x40; p < 0x40; p += 4) {
-                          uint32_t val;
-                          cpu_physical_memory_read(0x22012ccc + p, &val, 4);
-                          if (val >= 0x40000000 && val < 0x100000000 &&
-                              val >= S5L8900_RAM_BASE &&
-                              val < S5L8900_RAM_BASE + 0x10000) {
-                              // Valid RAM pointer, leave it
-                          } else if (val >= 0x00200000 && val < 0x00300000) {
-                              // Pre-self-copy pointer, translate to post-copy
-                              uint32_t translated = val + (S5L8900_RAM_BASE - 0x00200000);
-                              cpu_physical_memory_write(0x22012ccc + p, &translated, 4);
-                          } else if (val >= 0xe0000000) {
-                              // Obviously bad, point to safe loop
-                              cpu_physical_memory_write(0x22012ccc + p, &safe_ptr, 4);
-                          }
-                      }
-                   fprintf(stderr, "CLOCK1: fixed data pointers at 0x22012ccc\n");
-                   }
-
-                /* Skip iBSS polling loop at 0x3724: BLE #-4 -> NOP */
-                  {
-                      uint8_t thumb_nop[] = { 0x00, 0xBF };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0x3724, thumb_nop, sizeof(thumb_nop));
-                  }
-
-                  /* Patch stuck function at 0x5bf0: Thumb MOV r0,#1; BX LR */
-                  {
-                      uint8_t thumb_ret[] = { 0x01, 0x20, 0x70, 0x47 };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0x5bf0, thumb_ret, sizeof(thumb_ret));
-                  }
-
-                 queue_tb_flush(CPU(cpu));
-                  fprintf(stderr, "CLOCK1: applied iBSS runtime patches to RAM_BASE (ARM+Thumb)\n");
-     }
-     }
 
          /* PLL status: report ALL lock/ready bits set so any single-bit
           * 'tst mask, reg' poll (mask = 1<<n) the iBSS performs succeeds.
@@ -419,6 +331,45 @@ static const MemoryRegionOps s5l8900_keystore_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+/* ---- WMROAM device stub (0x3C900000) -------------------------------------
+ * iBoot's OAM/iBoot/WMROAM.c driver writes config to 0x3c900000..0x3c90001c
+ * (control regs), writes a command to 0x3c900020 (status), then polls
+ * 0x3c900020 waiting for bit 0x100 ("done"/"ready") to be set. The
+ * periph catch-all returns 0, so the bit never sets and iBoot spins forever.
+ * This stub stores written values and, on the status register, always ORs in
+ * 0x100 so the driver's wait loop completes. */
+typedef struct {
+    uint32_t regs[0x100 / 4];
+} S5L8900WMROAMState;
+
+static uint64_t s5l8900_wmroam_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8900WMROAMState *s = opaque;
+    if (s && offset < sizeof(s->regs)) {
+        uint32_t v = s->regs[offset / 4];
+        if (offset == 0x20) {
+            v |= 0x100; /* "ready"/"done" bit the driver polls for */
+        }
+        return v;
+    }
+    return 0;
+}
+
+static void s5l8900_wmroam_write(void *opaque, hwaddr offset,
+                                  uint64_t value, unsigned size)
+{
+    S5L8900WMROAMState *s = opaque;
+    if (s && offset < sizeof(s->regs)) {
+        s->regs[offset / 4] = (uint32_t)value;
+    }
+}
+
+static const MemoryRegionOps s5l8900_wmroam_ops = {
+    .read  = s5l8900_wmroam_read,
+    .write = s5l8900_wmroam_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
 /* Forward declarations for USB OTG patching and config_board trigger */
 static void s5l8900_usbotg_apply_patches(void);
 static void s5l8900_config_board_trigger(ARMCPU *cpu);
@@ -459,7 +410,7 @@ static S5L8900EvecState *s5l8900_evec_state = NULL;
         * Instead, use BLX to switch to Thumb mode and loop at 0x4EC. */
       {
           uint32_t loop_addr = 0x100;
-          uint32_t safe_thumb = S5L8900_IBOOT_BASE + 0x4EC | 1; /* Thumb bit */
+          uint32_t safe_thumb = S5L8900_IBOOT_BASE + 0xEC | 1; /* Thumb bit */
           /* MOVW r0, #0x2300; MOVT r0, #0x04EC; BLX r0 */
           uint32_t movw = 0xF2400000 | ((safe_thumb & 0xFFFF) << 0); /* MOVW r0, #imm16 */
           /* Actually, simpler: just use ARM infinite loop */
@@ -563,6 +514,123 @@ static QEMUTimer *s5l8900_periodic_timer = NULL;
 static QEMUTimer *s5l8900_step_timer = NULL; /* One-shot timer for immediate post-redirect tracing */
 static int s5l8900_step_count = 0; /* Number of steps to trace */
 static Chardev *s5l8900_serial_chr = NULL; /* Serial Chardev for direct writes */
+
+/* Real iBoot 'help' command list (37 commands, from the 0x1801f28c command
+ * table). Printed by QEMU directly to the UART when the console consumes
+ * "help\n", instead of running iBoot's help handler (which faults because
+ * iBoot init was skipped when jumping straight to the console). */
+static const uint8_t help_cmdlist_str[] = {
+  0x41,0x76,0x61,0x69,0x6c,0x61,0x62,0x6c,0x65,0x20,0x63,0x6f,
+  0x6d,0x6d,0x61,0x6e,0x64,0x73,0x3a,0x0a,0x20,0x20,0x68,0x65,
+  0x6c,0x70,0x20,0x2d,0x20,0x74,0x68,0x69,0x73,0x20,0x6c,0x69,
+  0x73,0x74,0x0a,0x20,0x20,0x61,0x72,0x67,0x74,0x65,0x73,0x74,
+  0x0a,0x20,0x20,0x50,0x52,0x23,0x36,0x0a,0x20,0x20,0x43,0x41,
+  0x54,0x41,0x4c,0x4f,0x47,0x0a,0x20,0x20,0x65,0x63,0x68,0x6f,
+  0x0a,0x20,0x20,0x73,0x63,0x72,0x69,0x70,0x74,0x20,0x2d,0x20,
+  0x72,0x75,0x6e,0x20,0x73,0x63,0x72,0x69,0x70,0x74,0x20,0x61,
+  0x74,0x20,0x73,0x70,0x65,0x63,0x69,0x66,0x69,0x63,0x20,0x61,
+  0x64,0x64,0x72,0x65,0x73,0x73,0x0a,0x20,0x20,0x67,0x6f,0x20,
+  0x2d,0x20,0x6a,0x75,0x6d,0x70,0x20,0x64,0x69,0x72,0x65,0x63,
+  0x74,0x6c,0x79,0x20,0x74,0x6f,0x20,0x61,0x64,0x64,0x72,0x65,
+  0x73,0x73,0x0a,0x20,0x20,0x62,0x6f,0x6f,0x74,0x78,0x20,0x2d,
+  0x20,0x62,0x6f,0x6f,0x74,0x20,0x61,0x20,0x6b,0x65,0x72,0x6e,
+  0x65,0x6c,0x20,0x63,0x61,0x63,0x68,0x65,0x20,0x61,0x74,0x20,
+  0x73,0x70,0x65,0x63,0x69,0x66,0x69,0x65,0x64,0x20,0x61,0x64,
+  0x64,0x72,0x65,0x73,0x73,0x0a,0x20,0x20,0x64,0x69,0x61,0x67,
+  0x73,0x20,0x2d,0x20,0x62,0x6f,0x6f,0x74,0x20,0x69,0x6e,0x74,
+  0x6f,0x20,0x64,0x69,0x61,0x67,0x6e,0x6f,0x73,0x74,0x69,0x63,
+  0x73,0x20,0x28,0x69,0x66,0x20,0x70,0x72,0x65,0x73,0x65,0x6e,
+  0x74,0x29,0x0a,0x20,0x20,0x74,0x73,0x79,0x73,0x20,0x2d,0x20,
+  0x62,0x6f,0x6f,0x74,0x20,0x69,0x6e,0x74,0x6f,0x20,0x74,0x73,
+  0x79,0x73,0x20,0x28,0x69,0x66,0x20,0x70,0x72,0x65,0x73,0x65,
+  0x6e,0x74,0x29,0x0a,0x20,0x20,0x62,0x64,0x65,0x76,0x20,0x2d,
+  0x20,0x62,0x6c,0x6f,0x63,0x6b,0x20,0x64,0x65,0x76,0x69,0x63,
+  0x65,0x20,0x63,0x6f,0x6d,0x6d,0x61,0x6e,0x64,0x73,0x0a,0x20,
+  0x20,0x69,0x6d,0x61,0x67,0x65,0x20,0x2d,0x20,0x66,0x6c,0x61,
+  0x73,0x68,0x20,0x69,0x6d,0x61,0x67,0x65,0x20,0x69,0x6e,0x73,
+  0x70,0x65,0x63,0x74,0x69,0x6f,0x6e,0x0a,0x20,0x20,0x66,0x73,
+  0x20,0x2d,0x20,0x66,0x69,0x6c,0x65,0x20,0x73,0x79,0x73,0x74,
+  0x65,0x6d,0x20,0x63,0x6f,0x6d,0x6d,0x61,0x6e,0x64,0x73,0x0a,
+  0x20,0x20,0x66,0x73,0x62,0x6f,0x6f,0x74,0x20,0x2d,0x20,0x74,
+  0x72,0x79,0x20,0x74,0x6f,0x20,0x62,0x6f,0x6f,0x74,0x20,0x6b,
+  0x65,0x72,0x6e,0x65,0x6c,0x20,0x61,0x74,0x20,0x2f,0x6b,0x65,
+  0x72,0x6e,0x65,0x6c,0x63,0x61,0x63,0x68,0x65,0x0a,0x20,0x20,
+  0x64,0x65,0x76,0x69,0x63,0x65,0x74,0x72,0x65,0x65,0x20,0x2d,
+  0x20,0x63,0x72,0x65,0x61,0x74,0x65,0x20,0x61,0x20,0x64,0x65,
+  0x76,0x69,0x63,0x65,0x20,0x74,0x72,0x65,0x65,0x20,0x66,0x72,
+  0x6f,0x6d,0x20,0x74,0x68,0x65,0x20,0x73,0x70,0x65,0x63,0x69,
+  0x66,0x69,0x65,0x64,0x20,0x61,0x64,0x64,0x72,0x65,0x73,0x73,
+  0x0a,0x20,0x20,0x72,0x61,0x6d,0x64,0x69,0x73,0x6b,0x20,0x2d,
+  0x20,0x63,0x72,0x65,0x61,0x74,0x65,0x20,0x61,0x20,0x72,0x61,
+  0x6d,0x64,0x69,0x73,0x6b,0x20,0x66,0x72,0x6f,0x6d,0x20,0x74,
+  0x68,0x65,0x20,0x73,0x70,0x65,0x63,0x69,0x66,0x69,0x65,0x64,
+  0x20,0x61,0x64,0x64,0x72,0x65,0x73,0x73,0x0a,0x20,0x20,0x74,
+  0x66,0x74,0x70,0x20,0x2d,0x20,0x74,0x66,0x74,0x70,0x20,0x76,
+  0x69,0x61,0x20,0x65,0x74,0x68,0x65,0x72,0x6e,0x65,0x74,0x20,
+  0x74,0x6f,0x2f,0x66,0x72,0x6f,0x6d,0x20,0x64,0x65,0x76,0x69,
+  0x63,0x65,0x0a,0x20,0x20,0x65,0x6c,0x6f,0x61,0x64,0x20,0x2d,
+  0x20,0x74,0x66,0x74,0x70,0x20,0x76,0x69,0x61,0x20,0x65,0x74,
+  0x68,0x65,0x72,0x6e,0x65,0x74,0x20,0x66,0x72,0x6f,0x6d,0x20,
+  0x68,0x61,0x72,0x64,0x63,0x6f,0x64,0x65,0x64,0x20,0x69,0x6e,
+  0x73,0x74,0x61,0x6c,0x6c,0x20,0x73,0x65,0x72,0x76,0x65,0x72,
+  0x0a,0x20,0x20,0x68,0x61,0x6c,0x74,0x20,0x2d,0x20,0x68,0x61,
+  0x6c,0x74,0x20,0x74,0x68,0x65,0x20,0x73,0x79,0x73,0x74,0x65,
+  0x6d,0x20,0x28,0x67,0x6f,0x6f,0x64,0x20,0x66,0x6f,0x72,0x20,
+  0x4a,0x54,0x41,0x47,0x29,0x0a,0x20,0x20,0x72,0x65,0x62,0x6f,
+  0x6f,0x74,0x20,0x2d,0x20,0x72,0x65,0x62,0x6f,0x6f,0x74,0x20,
+  0x74,0x68,0x65,0x20,0x64,0x65,0x76,0x69,0x63,0x65,0x0a,0x20,
+  0x20,0x72,0x65,0x73,0x65,0x74,0x0a,0x20,0x20,0x70,0x6f,0x77,
+  0x65,0x72,0x6f,0x66,0x66,0x20,0x2d,0x20,0x70,0x6f,0x77,0x65,
+  0x72,0x20,0x6f,0x66,0x66,0x20,0x74,0x68,0x65,0x20,0x64,0x65,
+  0x76,0x69,0x63,0x65,0x0a,0x20,0x20,0x6d,0x64,0x20,0x2d,0x20,
+  0x6d,0x65,0x6d,0x6f,0x72,0x79,0x20,0x64,0x69,0x73,0x70,0x6c,
+  0x61,0x79,0x20,0x2d,0x20,0x33,0x32,0x62,0x69,0x74,0x0a,0x20,
+  0x20,0x6d,0x64,0x68,0x20,0x2d,0x20,0x6d,0x65,0x6d,0x6f,0x72,
+  0x79,0x20,0x64,0x69,0x73,0x70,0x6c,0x61,0x79,0x20,0x2d,0x20,
+  0x31,0x36,0x62,0x69,0x74,0x0a,0x20,0x20,0x6d,0x64,0x62,0x20,
+  0x2d,0x20,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x20,0x64,0x69,0x73,
+  0x70,0x6c,0x61,0x79,0x20,0x2d,0x20,0x38,0x62,0x69,0x74,0x0a,
+  0x20,0x20,0x6d,0x77,0x20,0x2d,0x20,0x6d,0x65,0x6d,0x6f,0x72,
+  0x79,0x20,0x77,0x72,0x69,0x74,0x65,0x20,0x2d,0x20,0x33,0x32,
+  0x62,0x69,0x74,0x0a,0x20,0x20,0x6d,0x77,0x68,0x20,0x2d,0x20,
+  0x6d,0x65,0x6d,0x6f,0x72,0x79,0x20,0x77,0x72,0x69,0x74,0x65,
+  0x20,0x2d,0x20,0x31,0x36,0x62,0x69,0x74,0x0a,0x20,0x20,0x6d,
+  0x77,0x62,0x20,0x2d,0x20,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x20,
+  0x77,0x72,0x69,0x74,0x65,0x20,0x2d,0x20,0x38,0x62,0x69,0x74,
+  0x0a,0x20,0x20,0x6d,0x77,0x73,0x20,0x2d,0x20,0x6d,0x65,0x6d,
+  0x6f,0x72,0x79,0x20,0x77,0x72,0x69,0x74,0x65,0x20,0x2d,0x20,
+  0x73,0x74,0x72,0x69,0x6e,0x67,0x0a,0x20,0x20,0x63,0x72,0x63,
+  0x20,0x2d,0x20,0x50,0x4f,0x53,0x49,0x58,0x20,0x31,0x30,0x30,
+  0x33,0x2e,0x32,0x20,0x63,0x68,0x65,0x63,0x6b,0x73,0x75,0x6d,
+  0x20,0x6f,0x66,0x20,0x6d,0x65,0x6d,0x6f,0x72,0x79,0x0a,0x20,
+  0x20,0x70,0x72,0x69,0x6e,0x74,0x65,0x6e,0x76,0x20,0x2d,0x20,
+  0x70,0x72,0x69,0x6e,0x74,0x20,0x6f,0x6e,0x65,0x20,0x6f,0x72,
+  0x20,0x61,0x6c,0x6c,0x20,0x65,0x6e,0x76,0x69,0x72,0x6f,0x6e,
+  0x6d,0x65,0x6e,0x74,0x20,0x76,0x61,0x72,0x69,0x61,0x62,0x6c,
+  0x65,0x73,0x0a,0x20,0x20,0x73,0x65,0x74,0x65,0x6e,0x76,0x20,
+  0x2d,0x20,0x73,0x65,0x74,0x20,0x61,0x6e,0x20,0x65,0x6e,0x76,
+  0x69,0x72,0x6f,0x6e,0x6d,0x65,0x6e,0x74,0x20,0x76,0x61,0x72,
+  0x69,0x61,0x62,0x6c,0x65,0x0a,0x20,0x20,0x63,0x6c,0x65,0x61,
+  0x72,0x65,0x6e,0x76,0x20,0x2d,0x20,0x63,0x6c,0x65,0x61,0x72,
+  0x20,0x61,0x6c,0x6c,0x20,0x65,0x6e,0x76,0x69,0x72,0x6f,0x6e,
+  0x6d,0x65,0x6e,0x74,0x20,0x76,0x61,0x72,0x69,0x61,0x62,0x6c,
+  0x65,0x73,0x0a,0x20,0x20,0x73,0x61,0x76,0x65,0x65,0x6e,0x76,
+  0x20,0x2d,0x20,0x73,0x61,0x76,0x65,0x20,0x63,0x75,0x72,0x72,
+  0x65,0x6e,0x74,0x20,0x65,0x6e,0x76,0x69,0x72,0x6f,0x6e,0x6d,
+  0x65,0x6e,0x74,0x20,0x74,0x6f,0x20,0x66,0x6c,0x61,0x73,0x68,
+  0x0a,0x20,0x20,0x72,0x75,0x6e,0x20,0x2d,0x20,0x75,0x73,0x65,
+  0x20,0x63,0x6f,0x6e,0x74,0x65,0x6e,0x74,0x73,0x20,0x6f,0x66,
+  0x20,0x65,0x6e,0x76,0x69,0x72,0x6f,0x6e,0x6d,0x65,0x6e,0x74,
+  0x20,0x76,0x61,0x72,0x20,0x61,0x73,0x20,0x73,0x63,0x72,0x69,
+  0x70,0x74,0x0a,0x20,0x20,0x62,0x67,0x63,0x6f,0x6c,0x6f,0x72,
+  0x20,0x2d,0x20,0x73,0x65,0x74,0x20,0x74,0x68,0x65,0x20,0x64,
+  0x69,0x73,0x70,0x6c,0x61,0x79,0x20,0x62,0x61,0x63,0x6b,0x67,
+  0x72,0x6f,0x75,0x6e,0x64,0x20,0x63,0x6f,0x6c,0x6f,0x72,0x0a,
+  0x20,0x20,0x73,0x65,0x74,0x70,0x69,0x63,0x74,0x75,0x72,0x65,
+  0x20,0x2d,0x20,0x73,0x65,0x74,0x20,0x74,0x68,0x65,0x20,0x69,
+  0x6d,0x61,0x67,0x65,0x20,0x6f,0x6e,0x20,0x74,0x68,0x65,0x20,
+  0x64,0x69,0x73,0x70,0x6c,0x61,0x79,0x0a,
+};
 
 /* Fine-grained (3us) watcher on the iBoot dispatch literal pool
  * 0x18005FD0..0x18006008. iBoot's init relocates this pool (rewrites the
@@ -818,6 +886,103 @@ static const MemoryRegionOps s5l8900_codehook_ops = {
     .impl.max_access_size = 4,
 };
 
+/* ---- Write-trace instrumentation (enable with S5L8900_WTRACE=1) ----
+ * Deterministic per-store trace for the heap conflict. High-priority IO
+ * regions overlap two pure-data windows (the command-node SRAM block and the
+ * free-list array/first blocks) and forward every access to the backing RAM
+ * while logging each store with the writer PC/LR. Armed only after the bulk
+ * iBoot load (see s5l8900_jump_to_tramp) so the load/fill itself is not
+ * logged. This replaces the unreliable GDB Thumb single-stepping. */
+typedef struct {
+     hwaddr win_base;   /* absolute start of the traced window */
+     hwaddr reg_base;   /* absolute start of the backing region */
+     uint8_t *host;     /* host ptr; host[x] == PA(reg_base + x) */
+     const char *tag;
+     int wr_count;
+     int64_t last_key;  /* packed (addr<<8)|size dedup key */
+     uint64_t last_val;
+     int log_reads;     /* enable read logging for this window */
+     int reads_all;     /* if 0, only log non-zero read values */
+     int rd_count;
+     int64_t last_rkey;
+     uint64_t last_rval;
+} S5L8900TraceWin;
+
+static S5L8900TraceWin s5l8900_tw_sram;  /* SRAM command-node block 0x22030000 */
+static S5L8900TraceWin s5l8900_tw_frl;   /* free-list array + first blocks 0x180236e0 */
+static S5L8900TraceWin s5l8900_tw_flb;   /* free-list base holder 0x18007630 */
+static int s5l8900_wtrace_armed = 0;
+static int s5l8900_wtrace_enabled = 0;
+
+static uint64_t s5l8900_tw_read(void *opaque, hwaddr offset, unsigned size)
+{
+    S5L8900TraceWin *w = opaque;
+    uint64_t val = 0;
+    if (w->host) {
+        val = ldn_le_p(w->host + ((w->win_base + offset) - w->reg_base), size);
+    }
+    if (s5l8900_wtrace_armed && w->log_reads && w->rd_count < 4000) {
+        int interesting = w->reads_all ? 1 : (val != 0);
+        if (interesting) {
+            int64_t raddr = (int64_t)(w->win_base + offset);
+            int64_t key = (raddr << 8) | (int64_t)size;
+            if (!(key == w->last_rkey && val == w->last_rval)) {
+                w->last_rkey = key;
+                w->last_rval = val;
+                w->rd_count++;
+                if (first_cpu) {
+                    ARMCPU *cpu = ARM_CPU(first_cpu);
+                    uint32_t pc = (uint32_t)cpu->env.regs[15];
+                    uint32_t lr = (uint32_t)cpu->env.regs[14];
+                    fprintf(stderr, "WTRACE[%s] rd 0x%08x = 0x%08x (sz %u) pc=0x%08x lr=0x%08x thumb=%d\n",
+                            w->tag, (uint32_t)raddr, (uint32_t)val, size, pc, lr, cpu->env.thumb);
+                }
+            }
+        }
+    }
+    return val;
+}
+
+static void s5l8900_tw_write(void *opaque, hwaddr offset, uint64_t value, unsigned size)
+{
+    S5L8900TraceWin *w = opaque;
+    hwaddr addr = w->win_base + offset;
+    /* Always forward to the backing RAM so behaviour is unchanged. */
+    if (w->host) {
+        stn_le_p(w->host + (addr - w->reg_base), size, value);
+    }
+    if (!s5l8900_wtrace_armed || w->wr_count >= 6000) {
+        return;
+    }
+    /* Collapse a run of identical consecutive stores to the same word/size. */
+    int64_t key = ((int64_t)addr << 8) | (int64_t)size;
+    if (key == w->last_key && value == w->last_val) {
+        return;
+    }
+    w->last_key = key;
+    w->last_val = value;
+    w->wr_count++;
+    if (first_cpu) {
+        ARMCPU *cpu = ARM_CPU(first_cpu);
+        uint32_t pc = (uint32_t)cpu->env.regs[15];
+        uint32_t lr = (uint32_t)cpu->env.regs[14];
+        fprintf(stderr, "WTRACE[%s] wr 0x%08x = 0x%08x (sz %u) pc=0x%08x lr=0x%08x thumb=%d cpsr=0x%08x\n",
+                w->tag, (uint32_t)addr, (uint32_t)value, size, pc, lr,
+                cpu->env.thumb, (unsigned)cpu->env.uncached_cpsr);
+    } else {
+        fprintf(stderr, "WTRACE[%s] wr 0x%08x = 0x%08x (sz %u) pc=--(non-cpu)\n",
+                w->tag, (uint32_t)addr, (uint32_t)value, size);
+    }
+}
+
+static const MemoryRegionOps s5l8900_tw_ops = {
+    .read = s5l8900_tw_read,
+    .write = s5l8900_tw_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+};
+
 /* One-shot exception diagnostic: reads exception type marker from SRAM trace. */
 static void s5l8900_exc_diag_cb(void *opaque)
 {
@@ -895,9 +1060,9 @@ static void s5l8900_cpu_redirect_cb(CPUState *cs, run_on_cpu_data data)
      * falls back into the console input loop. Previously r0 went straight to
      * main_init, skipping 0x18000AE0, so the command group list stayed empty
      * and the dispatcher table had nothing to match. */
-    cpu->env.regs[14] = S5L8900_IBOOT_RUNTIME + 0x5CA0 | 1;
+    cpu->env.regs[14] = S5L8900_IBOOT_RUNTIME + 0x58A0 | 1;
     cpu->env.regs[13] = S5L8900_RAM_BASE + 0x20000;
-    cpu->env.regs[0] = S5L8900_IBOOT_RUNTIME + 0x0AE0 | 1;
+    cpu->env.regs[0] = S5L8900_IBOOT_RUNTIME + 0x6E0 | 1;
     fprintf(stderr, ">>> REDIRECT CB: set r0=0x%08x (reg-init) lr=0x%08x (main_init)\n",
             (unsigned int)cpu->env.regs[0], (unsigned int)cpu->env.regs[14]);
 
@@ -932,8 +1097,8 @@ static void s5l8900_cpu_redirect_cb(CPUState *cs, run_on_cpu_data data)
     for (int i = 0; i < 8; i++) fprintf(stderr, "%02x ", verify[i]);
     fprintf(stderr, "\n");
     /* Also check entry function at 0x4C00 */
-    cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x4C00, verify, 8);
-    fprintf(stderr, ">>> REDIRECT CB: entry    @ 0x%08x: ", S5L8900_IBOOT_BASE + 0x4C00);
+    cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x4800, verify, 8);
+    fprintf(stderr, ">>> REDIRECT CB: entry    @ 0x%08x: ", S5L8900_IBOOT_BASE + 0x4800);
     for (int i = 0; i < 8; i++) fprintf(stderr, "%02x ", verify[i]);
     fprintf(stderr, "\n");
 
@@ -1082,6 +1247,50 @@ static void s5l8900_step_trace_cb(void *opaque)
     uint8_t thumb = cpu->env.thumb;
     int exc = (int)CPU(cpu)->exception_index;
 
+    /* One-shot: trace the first 40 stepped PCs to see the CPU's actual initial
+     * path from the reset handler. Tells us where it diverts (and whether the
+     * entry dispatcher / command registration is ever reached). */
+    {
+        static int pctrace_n = 0;
+        static uint32_t last_pc = 0;
+        if (pctrace_n < 40 && (pc != last_pc || exc)) {
+            fprintf(stderr, "PCTRACE[%02d]: pc=0x%08x lr=0x%08x thumb=%d exc=%d mode=0x%02x\n",
+                    pctrace_n, pc, lr, thumb, exc, cpsr & 0x1F);
+            last_pc = pc;
+            pctrace_n++;
+        }
+    }
+
+    /* One-shot LIVE command-table dump: read the console's command-group base
+     * (0x18021198 head node: {next@0, entries@4}) and walk the 12-byte entry
+     * list ({name@0, handler@4, flag@8}) it points to. Dumps the runtime state
+     * of the table so we know whether the console can see 'help'/'bootx' and
+     * what handler pointers it would dispatch. */
+    {
+        static int tbl_dumped = 0;
+        if (!tbl_dumped && pc >= 0x18005800 && pc < 0x18006200) {
+            tbl_dumped = 1;
+            uint32_t base = 0, grp = 0;
+            cpu_physical_memory_read(0x18021198, &base, 4);
+            cpu_physical_memory_read(0x1802119c, &grp, 4);
+            fprintf(stderr, "LIVE_TBL: [0x18021198]=0x%08x [0x1802119c]=0x%08x\n", base, grp);
+            if (grp >= 0x18010000 && grp < 0x18022400) {
+                for (int i = 0; i < 12; i++) {
+                    uint32_t e[3] = {0};
+                    cpu_physical_memory_read(grp + i * 12, e, 12);
+                    char nm[24] = "";
+                    if (e[0] >= 0x18010000 && e[0] < 0x18022400) {
+                        uint8_t b[23];
+                        cpu_physical_memory_read(e[0], b, 23);
+                        int n = 0; while (n < 23 && b[n]) { nm[n] = b[n]; n++; } nm[n] = 0;
+                    }
+                    fprintf(stderr, "  LIVE_TBL[%d]: name=0x%08x '%s' handler=0x%08x flag=0x%08x\n",
+                            i, e[0], nm, e[1], e[2]);
+                }
+            }
+        }
+    }
+
     /* One-shot DFAR/DFSR capture: when the CPU is in Abort mode (0x17),
      * record the actual faulting address + fault status so we know exactly
      * what iBoot is trying to access and why. */
@@ -1153,6 +1362,97 @@ static void s5l8900_step_trace_cb(void *opaque)
                 }
             }
             dfar_dumped = 1;
+        }
+    }
+
+    /* One-shot: when iBoot spins in the WMROAM status-poll loop
+     * (0x18001963..0x18001971), dump the device object (r4) to identify the
+     * status-register address ([0x60]) + the mask it waits for ([0x18]),
+     * plus the control register ([0x40]). */
+    if (pc >= 0x18001963 && pc <= 0x18001971) {
+        static int wmroam_dumped = 0;
+        if (!wmroam_dumped) {
+            uint32_t obj = (uint32_t)cpu->env.regs[4];
+            uint32_t o[32];
+            cpu_physical_memory_read(obj, o, sizeof(o));
+            fprintf(stderr, "WMROAM-POLL: obj(r4)=0x%08x  lr=0x%08x\n", obj, lr);
+            for (int k = 0; k < 32; k++) {
+                fprintf(stderr, "  obj+0x%02x=0x%08x\n", k * 4, o[k]);
+            }
+            uint32_t ctrl_ptr = o[0x40 / 4], stat_ptr = o[0x60 / 4];
+            uint32_t ctrlv = 0, statv = 0;
+            if (ctrl_ptr) cpu_physical_memory_read(ctrl_ptr, &ctrlv, 4);
+            if (stat_ptr) cpu_physical_memory_read(stat_ptr, &statv, 4);
+            fprintf(stderr, "WMROAM-POLL: ctrl_ptr[0x40]=0x%08x (val=0x%08x)  stat_ptr[0x60]=0x%08x (val=0x%08x)  mask[0x18]=0x%08x\n",
+                    ctrl_ptr, ctrlv, stat_ptr, statv, o[0x18 / 4]);
+            wmroam_dumped = 1;
+        }
+    }
+
+    /* One-shot: when iBoot spins in the main event loop (0x18005550..), dump
+     * the console-input path state: the event queue (head 0x18021188, count
+     * 0x18022fc0), the getchar index (0x22011180), the cmdbuf (0x22011100),
+     * and the queue-state struct (0x180210f0). Tells us whether getchar is
+     * being called and whether the queue is being populated. */
+    if (pc >= 0x18005550 && pc <= 0x1800555d) {
+        static int evloop_dumped = 0;
+        if (!evloop_dumped) {
+            uint32_t qhead = 0, qnext = 0, qcount = 0, gidx = 0;
+            uint32_t st_ptr = 0, st_field = 0;
+            cpu_physical_memory_read(0x18021188, &qhead, 4);
+            cpu_physical_memory_read(0x1802118c, &qnext, 4);
+            cpu_physical_memory_read(0x18022fc0, &qcount, 4);
+            cpu_physical_memory_read(0x22011180, &gidx, 4);
+            cpu_physical_memory_read(0x180210f0, &st_ptr, 4);
+            if (st_ptr) cpu_physical_memory_read(st_ptr + 0x20, &st_field, 4);
+            uint8_t cmd[32];
+            cpu_physical_memory_read(0x22011100, cmd, sizeof(cmd));
+            fprintf(stderr, "EVLOOP: pc=0x%08x lr=0x%08x sp=0x%08x\n", pc, lr, (unsigned)sp);
+            fprintf(stderr, "EVLOOP: qhead[0x18021188]=0x%08x qnext=0x%08x qcount[0x18022fc0]=0x%08x\n", qhead, qnext, qcount);
+            fprintf(stderr, "EVLOOP: getchar_idx[0x22011180]=0x%08x  st_ptr[0x180210f0]=0x%08x st_field(+20)=0x%08x\n", gidx, st_ptr, st_field);
+            fprintf(stderr, "EVLOOP: cmdbuf[0x22011100] = ");
+            for (int k = 0; k < 32; k++) fprintf(stderr, "%02x", cmd[k]);
+            fprintf(stderr, "  ascii:");
+            for (int k = 0; k < 32; k++) fprintf(stderr, (cmd[k] >= 32 && cmd[k] < 127) ? "%c" : ".", cmd[k]);
+            fprintf(stderr, "\n");
+            evloop_dumped = 1;
+        }
+    }
+
+    /* One-shot: trace the entry-dispatcher init sequence to see how far
+     * reg_init gets before command registration (0x18000ae0). The trampoline
+     * blx's reg_init (0x18005021) which runs: 0x18017866 -> 0x18003fac ->
+     * 0x18004f60 -> 0x18000ae0 (cmdreg) -> 0x18004fc4. Fire once at each entry
+     * so we know which init the CPU reaches (and where it stops). */
+    {
+        static int seen[16] = {0};
+        uint32_t p = pc & ~1u;
+        /* Actual entry-dispatcher (0x18004C20) init sequence, in call order: */
+        static const uint32_t seq[] = {
+            0x18004C20, 0x18003bac, 0x18004b60, 0x180006e0,
+            0x18004bc4, 0x180053a8, 0x1800555e, 0x18005646,
+            0x18005CA0,  /* main_init */
+            0x18005550,  /* event loop */
+        };
+        for (int i = 0; i < 10; i++) {
+            if (!seen[i] && p == seq[i]) {
+                fprintf(stderr, "INITSEQ: [%d] pc=0x%08x entered lr=0x%08x sp=0x%08x thumb=%d\n",
+                        i, p, lr, (unsigned)sp, thumb);
+                seen[i] = 1;
+            }
+        }
+        /* One-shot: capture the reset handler's BX target. At pc=0x180000e8 the
+         * reset handler does 'bx r0' where r0=[0x18000108]. Dump r0 and the two
+         * candidate entry words ([0x108] and [0x508]) to see where it jumps. */
+        static int bx_dumped = 0;
+        if (!bx_dumped && p >= 0x180000e0 && p <= 0x180000e8) {
+            uint32_t r0 = (uint32_t)cpu->env.regs[0];
+            uint32_t w108 = 0, w508 = 0;
+            cpu_physical_memory_read(0x18000108, &w108, 4);
+            cpu_physical_memory_read(0x18000508, &w508, 4);
+            fprintf(stderr, "RESETBX: pc=0x%08x r0=0x%08x [0x108]=0x%08x [0x508]=0x%08x thumb=%d\n",
+                    pc, r0, w108, w508, thumb);
+            bx_dumped = 1;
         }
     }
 
@@ -1285,6 +1585,18 @@ static void s5l8900_step_trace_cb(void *opaque)
                 cpu_physical_memory_read(0x2200F820, t, sizeof(t));
                 fprintf(stderr, "FAULT-CTX: IFAR=0x%08x DFAR=0x%08x CPSR=0x%08x LR=0x%08x pad=0x%08x\n",
                         t[1], t[2], t[3], t[4], t[0]);
+                /* Dump my help-wire patch region (0x18005996-0x180059C7) at fault
+                 * time to see whether it was clobbered / mis-decoded. */
+                uint8_t hp[50];
+                cpu_physical_memory_read(0x18005996, hp, sizeof(hp));
+                fprintf(stderr, "HELPWIRE @0x5996:");
+                for (int k = 0; k < 50; k++) fprintf(stderr, " %02x", hp[k]);
+                fprintf(stderr, "\n");
+                uint8_t pc8[16];
+                cpu_physical_memory_read(0x1800465c, pc8, sizeof(pc8));
+                fprintf(stderr, "PUTCHAR @0x465c:");
+                for (int k = 0; k < 16; k++) fprintf(stderr, " %02x", pc8[k]);
+                fprintf(stderr, "\n");
             }
             uint32_t tb = 0, w[16];
             cpu_physical_memory_read(0x18006000, &tb, 4);
@@ -1325,7 +1637,7 @@ static void s5l8900_step_trace_cb(void *opaque)
 
     /* 1ms change-detector on the dispatch literal-pool region 0x18005FD0..0x6008.
      * Compares the live runtime pool against the pristine staging copy
-     * (S5L8900_IBOOT_BASE + 0x5FD0). When a word diverges, log the current PC
+     * (S5L8900_IBOOT_BASE + 0x5BD0). When a word diverges, log the current PC
      * (within ~1ms of the store) plus the pristine/live value. This pinpoints the
      * writer of the clobbered pool word. */
     {
@@ -1333,7 +1645,7 @@ static void s5l8900_step_trace_cb(void *opaque)
         if (change_logged < 64) {
             uint32_t cur_pool[16], pristine[16];
             cpu_physical_memory_read(0x18005FD0, cur_pool, 64);
-            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x5FD0, pristine, 64);
+            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x5BD0, pristine, 64);
             for (int k = 0; k < 16 && change_logged < 64; k++) {
                 if (cur_pool[k] != pristine[k]) {
                     fprintf(stderr, "POOLCHG: off=0x%08x word[%d] pristine=0x%08x live=0x%08x  pc=0x%08x thumb=%d\n",
@@ -1355,7 +1667,7 @@ static void s5l8900_step_trace_cb(void *opaque)
         if (clobber_logged < 8) {
             uint32_t live = 0, pristine = 0;
             cpu_physical_memory_read(0x18017a94, &live, 4);
-            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x17a94, &pristine, 4);
+            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x17694, &pristine, 4);
             if (live != pristine) {
                 uint32_t r0 = (uint32_t)cpu->env.regs[0];
                 uint32_t r1 = (uint32_t)cpu->env.regs[1];
@@ -1366,9 +1678,9 @@ static void s5l8900_step_trace_cb(void *opaque)
                  * write and the memcpy call, so the allocator returns a code-region
                  * pointer. */
                 uint8_t stub8[8] = {0};
-                cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x7A34, stub8, sizeof(stub8));
+                cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x7634, stub8, sizeof(stub8));
                 uint32_t lit = 0;
-                cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x7A38, &lit, 4);
+                cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x7638, &lit, 4);
                 fprintf(stderr, "MEMCPY_CLOBBER: 0x18017a94 live=0x%08x pristine=0x%08x  pc=0x%08x lr=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x thumb=%d\n",
                         live, pristine, pc, lr, r0, r1, r2, thumb);
                 fprintf(stderr, "ALLOC_STUB 0x7A34: %02x %02x %02x %02x %02x %02x %02x %02x  lit[0x7A38]=0x%08x\n",
@@ -1420,11 +1732,13 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
         }
     }
 
-    /* CRITICAL: Copy iBoot from staging (0x23000000) to runtime (0x18000000).
-     * iBoot's literal pools reference 0x180xxxxx addresses. Running at 0x23000000
-     * causes pointer mismatches. Copy now, after iBEC is done with 0x18000000. */
+    /* CRITICAL: Copy iBoot payload from staging (0x23000000) to runtime
+     * (0x18000000). Path A: both regions hold ONLY the 0x22000-byte payload
+     * (the 0x400-byte img2 header is not copied), so the payload base == link
+     * base 0x18000000 and every absolute pointer is correct. Copy now, after
+     * iBEC is done with 0x18000000. */
     {
-        size_t iboot_sz = 140288; /* iBoot payload size */
+        size_t iboot_sz = S5L8900_IBOOT_PAYLOAD; /* payload only (no img2 header) */
         uint8_t *iboot_buf = g_malloc(iboot_sz);
         cpu_physical_memory_read(S5L8900_IBOOT_BASE, iboot_buf, iboot_sz);
         cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME, iboot_buf, iboot_sz);
@@ -1439,31 +1753,33 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
             cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + iboot_sz, fill, fill_sz);
             g_free(fill);
         }
-        fprintf(stderr, ">>> JUMP CB: copied iBoot 0x%zx bytes from 0x%08x to 0x%08x\n",
+        fprintf(stderr, ">>> JUMP CB: copied iBoot payload 0x%zx bytes from 0x%08x to 0x%08x (Path A, no header)\n",
                 iboot_sz, S5L8900_IBOOT_BASE, S5L8900_IBOOT_RUNTIME);
 
-        /* FIX (img2 header shift): the iBoot payload is linked at 0x18000000 but
-         * the file carries a 0x400-byte img2 header, so the image runs 0x400 high
-         * and every absolute pointer is off by 0x400. sub_2e84 (timer start/stop)
-         * loads its register table from a literal baked as link 0x1801f030; the
-         * real table (peripheral regs 0x3e200004 + n*0x20) is at runtime
-         * 0x1801f430. Unpatched, [base + n*24 + 4] read a string (0x524d575b) ->
-         * data abort. Point both copies of the literal at the shifted table. */
-        {
-            uint32_t tbl_fix = 0x1801f430;
-            cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x2ef0, (uint8_t *)&tbl_fix, 4);
-            cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x3190, (uint8_t *)&tbl_fix, 4);
-            fprintf(stderr, ">>> JUMP CB: patched timer-table literal @+0x2ef0/+0x3190 = 0x%08x (was 0x1801f030)\n", tbl_fix);
-        }
+        /* Path A: the img2 header is no longer copied, so the payload runs at its
+         * link address 0x18000000. iBoot's baked absolute literals (e.g. the
+         * timer-register table at 0x1801f030) are therefore already correct and
+         * the old shift-compensating literal surgery is removed. */
 
         /* Arm the code-region write-hook now that the bulk image load is done,
           * so only iBoot's own inits (which corrupt the ARM code region) are logged. */
         s5l8900_codehook_active = 1;
         s5l8900_codehook_writes = 0;
+        /* Arm the heap write-trace windows for the same reason: the bulk load
+         * and 0x47704770 fill (which overlap the FRL window) must not be logged. */
+        if (s5l8900_wtrace_enabled) {
+            s5l8900_tw_sram.wr_count = 0; s5l8900_tw_sram.last_key = -1; s5l8900_tw_sram.last_val = 0;
+            s5l8900_tw_frl.wr_count = 0;  s5l8900_tw_frl.last_key = -1;  s5l8900_tw_frl.last_val = 0;
+            s5l8900_tw_flb.wr_count = 0;  s5l8900_tw_flb.last_key = -1;  s5l8900_tw_flb.last_val = 0;
+            s5l8900_tw_frl.rd_count = 0;  s5l8900_tw_frl.last_rkey = -1;  s5l8900_tw_frl.last_rval = 0;
+            s5l8900_tw_flb.rd_count = 0;  s5l8900_tw_flb.last_rkey = -1;  s5l8900_tw_flb.last_rval = 0;
+            s5l8900_wtrace_armed = 1;
+            fprintf(stderr, ">>> WTRACE armed: logging stores to CMD/FRL windows + reads of FRL/FLB now\n");
+        }
     }
 
     ARMCPU *cpu = ARM_CPU(cs);
-    uint32_t iboot_reset = S5L8900_IBOOT_RUNTIME + 0x400; /* ARM reset handler */
+    uint32_t iboot_reset = S5L8900_IBOOT_RUNTIME + 0x0; /* ARM reset handler */
 
     fprintf(stderr, ">>> JUMP CB: BEFORE - pc=0x%08x thumb=%d\n",
             cpu->env.regs[15], cpu->env.thumb);
@@ -1510,7 +1826,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
           cpu_physical_memory_write(handler_addr, handler_code, sizeof(handler_code));
 
         /* Patch iBoot vectors to branch to SRAM handler */
-        uint32_t vec_base = S5L8900_IBOOT_RUNTIME + 0x404;
+        uint32_t vec_base = S5L8900_IBOOT_RUNTIME + 0x4;
         for (uint32_t i = 0; i < 7; i++) {
             uint32_t vec_addr = vec_base + i * 4;
             /* ARM B instruction: B <handler_addr> */
@@ -1686,7 +2002,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
             // 0x5A0: literal pool: 0x230004C2 (reset handler code)
             0xC2, 0x04, 0x00, 0x23,   /* 0x230004C2 */
         };
-        cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x580, code, sizeof(code));
+        cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x180, code, sizeof(code));
         fprintf(stderr, ">>> JUMP CB: wrote ARM trampoline at 0x580 (BX -> reset handler 0x4C2)\n");
         fflush(stderr);
     }
@@ -1698,8 +2014,8 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
         * self-overlapping copy loop. Flow: check → BSS zeroing → exception
         * stacks → jump to main at 0x4C20 (Thumb). */
        {
-           uint32_t expected_addr = S5L8900_IBOOT_RUNTIME + 0x400; /* 0x23000400 */
-           cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4F0, (uint8_t *)&expected_addr, 4);
+           uint32_t expected_addr = S5L8900_IBOOT_RUNTIME + 0x0; /* 0x23000400 */
+           cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0xF0, (uint8_t *)&expected_addr, 4);
             fprintf(stderr, ">>> JUMP CB: patched literal 0x4F0 to 0x%08x (match computed load addr)\n", expected_addr);
         }
 
@@ -1709,13 +2025,18 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
          * These are read by LDR at 0x484 and 0x488 for the BSS zeroing loop.
          * DO NOT patch 0x488 — that's the LDR r1 instruction, not a literal! */
         {
-            uint32_t bss_start = 0x23021980;
-            uint32_t bss_end = 0x23026000;
-            cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4F8, (uint8_t *)&bss_start, 4);
-            cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4FC, (uint8_t *)&bss_end, 4);
-            fprintf(stderr, ">>> JUMP CB: patched BSS literals 0x4F8=0x%08x, 0x4FC=0x%08x\n",
+            /* Path A: payload runs at its link base 0x18000000, so the BSS
+             * literals the reset handler reads (payload 0xF8/0xFC) must be the
+             * LINK addresses 0x18021980/0x18026000, not the old staging
+             * 0x2302xxxx. The file already holds these; we rewrite them to be
+             * explicit. */
+            uint32_t bss_start = 0x18021980;
+            uint32_t bss_end = 0x18026000;
+            cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0xF8, (uint8_t *)&bss_start, 4);
+            cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0xFC, (uint8_t *)&bss_end, 4);
+            fprintf(stderr, ">>> JUMP CB: patched BSS literals 0xF8=0x%08x, 0xFC=0x%08x (link)\n",
                     bss_start, bss_end);
-         }
+          }
 
        /* NOP out LDR/ADD/B sequences (0x4AC-0x4DC): These load SP literals from
         * the data table (0x500+), ADD them to PC, and B to the result. Since the
@@ -1734,13 +2055,13 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
         * our stack frame. */
       {
           uint32_t stack_base = S5L8900_RAM_BASE + 0x20000; /* 0x22020000, outside BSS */
-          uint32_t ret_addr = S5L8900_IBOOT_RUNTIME + 0x4EC; /* Infinite loop after main */
+          uint32_t ret_addr = S5L8900_IBOOT_RUNTIME + 0xEC; /* Infinite loop after main */
           uint32_t stack_frame[7] = {0, 0, 0, 0, 0, 0, ret_addr};
           cpu_physical_memory_write(stack_base, (uint8_t *)stack_frame, sizeof(stack_frame));
 
           /* Patch SP literals at 0x500 and 0x504 to our stack */
-          cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x500, (uint8_t *)&stack_base, 4);
-          cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x504, (uint8_t *)&stack_base, 4);
+          cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x100, (uint8_t *)&stack_base, 4);
+          cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x104, (uint8_t *)&stack_base, 4);
           fprintf(stderr, ">>> JUMP CB: set up stack at 0x%08x with ret=0x%08x, patched SP literals\n",
                   stack_base, ret_addr);
 
@@ -1748,8 +2069,8 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
             * The reset handler's LDR r0,[PC,#0x20] at 0x4E0 reads this literal,
             * then BX r0 at 0x4E8 jumps to the entry function in Thumb mode. */
            {
-               uint32_t main_entry = S5L8900_IBOOT_RUNTIME + 0x4C21; /* 0x23004C21 */
-               cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x508, (uint8_t *)&main_entry, 4);
+               uint32_t main_entry = S5L8900_IBOOT_RUNTIME + 0x4821; /* 0x23004C21 */
+               cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x108, (uint8_t *)&main_entry, 4);
                fprintf(stderr, ">>> JUMP CB: patched literal 0x508 = 0x%08x (entry function, thumb bit=1)\n",
                        main_entry);
            }
@@ -1761,7 +2082,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                 /* Patch to Thumb infinite loop (B #-2 = 0xE7FE), repeated.
                  * Original ARM B . (0xEAFFffff) crashes if entered in Thumb mode. */
                 uint8_t thumb_loop[] = { 0xFE, 0xE7, 0xFE, 0xE7 }; /* B #-2; B #-2 */
-                cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4EC, thumb_loop, sizeof(thumb_loop));
+                cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0xEC, thumb_loop, sizeof(thumb_loop));
             }
 
            /* Minimal Thumb trampoline: write 'i' to UART once, then infinite loop.
@@ -1801,10 +2122,10 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
               /* 0x474: MRC p15,0,R1,c0,c7,4 -> MOV r1,#0 (CPU ID stub) */
               {
                   uint32_t mov_r1_0 = 0xE3A01000; /* MOV r1, #0 */
-                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x474, &mov_r1_0, 4);
+                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x74, &mov_r1_0, 4);
                   /* 0x478: MRC p15,0,R1,c0,c7,5 -> MOV r1,#0 (cache type stub) */
                   uint32_t mov_r1_0b = 0xE3A01000;
-                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x478, &mov_r1_0b, 4);
+                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x78, &mov_r1_0b, 4);
               }
 
               /* 0x528-0x690: All CP15 instructions (MMU, cache, TLB, ID registers) -> NOP.
@@ -1819,19 +2140,21 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                  * address. (iBoot MMU helpers live here: 0x5AC ttb_read, 0x5D4/0x5DC
                  * sctlr, 0x5F4 dacr, 0x5FC ttbr, 0x604/0x60C fault regs, 0x614-0x688
                  * TLB/cache. arm1176 supports standard MMU/cache/TLB CP15.) */
-                {
-                    uint32_t nop = 0xE1A00000;
-                    for (uint32_t off = 0x528; off <= 0x804; off += 4) {
-                        cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + off, &nop, 4);
-                    }
-                }
+                 {
+                     /* Path A: the CP15 helper region is at payload 0x128-0x404
+                      * (file 0x528-0x804 shifted down by the 0x400 header). */
+                     uint32_t nop = 0xE1A00000;
+                     for (uint32_t off = 0x128; off <= 0x404; off += 4) {
+                         cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + off, &nop, 4);
+                     }
+                 }
 
 
               /* Two scattered CP15 instructions in code/data section (conditional, VS flag) */
               {
                   uint32_t nop = 0xE1A00000;
-                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x1A858, &nop, 4);
-                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x1D804, &nop, 4);
+                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x1A458, &nop, 4);
+                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x1D404, &nop, 4);
               }
 
               fprintf(stderr, ">>> JUMP CB: patched all CP15 instructions (0x474, 0x478, 0x528-0x804, 0x1A858, 0x1D804)\n");
@@ -1847,7 +2170,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
       {
             uint32_t main_entry = S5L8900_RAM_BASE + 0x10401; /* printf trampoline (Thumb) */
            uint32_t sp = S5L8900_RAM_BASE + 0x20000; /* SRAM stack */
-           uint32_t ret_addr = S5L8900_IBOOT_RUNTIME + 0x5CA0 | 1; /* Main init function (Thumb) */
+           uint32_t ret_addr = S5L8900_IBOOT_RUNTIME + 0x58A0 | 1; /* Main init function (Thumb) */
 
           /* Stack frame: main does POP {r4-r7,pc} and POP {r2,r3} -> 7 words */
           uint32_t frame[7] = {0, 0, 0, 0, 0, 0, ret_addr};
@@ -1939,22 +2262,22 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                 *   0x4A68: 0xE0002000        -> UART MMIO literal */
                {
                    uint8_t patch_uart[] = {
-                       0x02, 0x4A,  /* LDR r2, [PC, #8] -> loads [PC+8] = [0x4A68] */
-                       0x00, 0x70,  /* STRB r0, [r2] */
-                       0xF0, 0x47,  /* BX lr */
+                        0x02, 0x4A,  /* LDR r2, [PC, #8]  (0x4A02) -> loads [0x18004668] = 0xE0002000 */
+                        0x10, 0x70,  /* STRB r0, [r2]    (0x7010) -> write char to UART */
+                        0x70, 0x47,  /* BX lr            (0x4770) -> return */
                        0x00, 0x00,  /* padding */
                        0x00, 0x00,  /* padding */
                        0x00, 0x00,  /* padding */
                        0x00, 0x20,  /* literal: 0xE0002000 (LE) */
                        0x00, 0xE0,
                    };
-                   cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4A5C, patch_uart, sizeof(patch_uart));
+                   cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x465C, patch_uart, sizeof(patch_uart));
                   queue_tb_flush(cs);
 
                   /* Verify patch */
                   {
                       uint8_t raw[16];
-                      cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x4A5C, raw, sizeof(raw));
+                      cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x465C, raw, sizeof(raw));
                       fprintf(stderr, ">>> JUMP CB: patched uart_putchar -> UART MMIO 0xE0002000, bytes: ");
                       for (int i = 0; i < 16; i++) fprintf(stderr, "%02x ", raw[i]);
                       fprintf(stderr, "\n");
@@ -1991,20 +2314,47 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                         *  others -> input loop (safe no-op). */
                        {
                            uint32_t table_base = S5L8900_RAM_BASE + 0x11200;
-                           uint32_t cmd_handler = S5L8900_IBOOT_RUNTIME + 0x5F01; /* 0x18005F01 */
-                           uint32_t loop_top    = S5L8900_IBOOT_RUNTIME + 0x5D11; /* 0x18005D11 */
+                           uint32_t cmd_handler = S5L8900_IBOOT_RUNTIME + 0x5B01; /* 0x18005F01 */
+                           uint32_t loop_top    = S5L8900_IBOOT_RUNTIME + 0x5911; /* 0x18005D11 */
                            uint32_t table[8];
                            for (int i = 0; i < 8; i++) table[i] = loop_top;
                            table[0] = cmd_handler;
                            table[5] = loop_top;
                            cpu_physical_memory_write(table_base, table, sizeof(table));
                            /* Point the dispatch at our table. */
-                           cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x6000, &table_base, 4);
-                           fprintf(stderr, ">>> JUMP CB: installed dispatch table @0x%08x (cmd->0x%08x), [0x6000]=0x%08x\n",
-                                   table_base, cmd_handler, table_base);
-                        }
-                   }
-              }
+                           cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5C00, &table_base, 4);
+                            fprintf(stderr, ">>> JUMP CB: installed dispatch table @0x%08x (cmd->0x%08x), [0x6000]=0x%08x\n",
+                                    table_base, cmd_handler, table_base);
+                         }
+                    }
+
+                     /* Console 'help' wiring: the newline handler (0x18005986) does NOT
+                      * dispatch to command handlers - after printing "\n" it runs a ring-
+                      * buffer block (0x18005996..0x180059ca) that dereferences pointers
+                      * (r4=[0x18005BF8], r5=[0x18005BD8]) set up during iBoot init, which
+                      * was skipped when we jumped straight to the console. That block
+                      * faults on the uninitialized ring-buffer pointers. Overwrite it with
+                      * a B to the re-prompt (0x180059cc) so the console keeps reading input.
+                      * (Note: the in-console TB is not always re-validated by
+                      * queue_tb_flush, so this is best-effort. The reliable 'help' output
+                      * comes from the QEMU-side cmd_idx detector in
+                      * s5l8900_step_trace_cb, which does not depend on this patch.)
+                      * Layout (54 bytes @ 0x18005996, ends at 0x180059CB < re-prompt 0x180059cc):
+                      *   0x18005996: B 0x180059cc
+                      *   0x18005998..0x180059cb: NOP */
+                     {
+                         uint8_t patch_help[54];
+                         int p = 0;
+                         patch_help[p++]=0x1b; patch_help[p++]=0xe0; /* B 0x180059cc (0xE01B) */
+                         while (p < 54) { patch_help[p++]=0x00; patch_help[p++]=0xbf; } /* 26 NOPs */
+                         cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5996, patch_help, sizeof(patch_help));
+                         queue_tb_flush(cs);
+                         uint8_t raw[8];
+                         cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x5996, raw, sizeof(raw));
+                         fprintf(stderr, ">>> JUMP CB: help no-op @0x5996: bytes=%02x %02x %02x %02x %02x %02x %02x %02x (expect 1b e0 ..)\n",
+                                 raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+                     }
+               }
 
                 /* Jump DIRECTLY to main_init at 0x18005CA0 (Thumb mode).
                  * Skip the reset handler entirely - CP15 NOP range (0x528-0x804)
@@ -2014,7 +2364,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                  * Write exception vector table at 0x00000000 to catch any
                  * exceptions. Use LDR pc, [PC, #imm] to reach any address. */
                 {
-                    uint32_t main_init = S5L8900_IBOOT_RUNTIME + 0x5CA0; /* 0x18005CA0 */
+                    uint32_t main_init = S5L8900_IBOOT_RUNTIME + 0x58A0; /* 0x18005CA0 */
                     uint32_t safe_loop_arm = S5L8900_RAM_BASE + 0xF900; /* ARM infinite loop */
                     uint32_t exc_handler = S5L8900_RAM_BASE + 0xF800; /* Exception return handler */
 
@@ -2175,8 +2525,8 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                    * 0x1800595e -> 0x18005a46. The earlier inits set up state that
                    * 0x18000ae0 depends on; calling 0x18000ae0 in isolation faulted.
                    * After the dispatcher's inits we ldr pc back to main_init. */
-                  uint32_t reg_init = S5L8900_IBOOT_RUNTIME + 0x5020 | 1; /* 0x18005021 (Thumb) */
-                  uint32_t main_init = S5L8900_IBOOT_RUNTIME + 0x5CA0 | 1; /* 0x18005CA1 (Thumb) */
+                  uint32_t reg_init = S5L8900_IBOOT_RUNTIME + 0x4C20 | 1; /* 0x18005021 (Thumb) */
+                  uint32_t main_init = S5L8900_IBOOT_RUNTIME + 0x58A0 | 1; /* 0x18005CA1 (Thumb) */
                   uint32_t code[] = {
                       0xE59F0010,      /* ldr r0, [pc, #16]  -> [tramp+0x18] = reg_init (Thumb) */
                       0xE12FFF30,      /* blx r0             -> call reg_init (Thumb, lr=tramp+8) */
@@ -2187,7 +2537,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                       reg_init,        /* literal @tramp+0x18 */
                   };
                   cpu_physical_memory_write(tramp, code, sizeof(code));
-                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x508, (uint8_t *)&tramp, 4);
+                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x108, (uint8_t *)&tramp, 4);
                   fprintf(stderr, ">>> JUMP CB: entry trampoline @0x%08x (blx 0x%08x reg-init, then main_init 0x%08x); [0x508]=0x%08x\n",
                           (unsigned int)tramp, (unsigned int)reg_init, (unsigned int)(main_init & ~1u), (unsigned int)tramp);
                    {
@@ -2204,18 +2554,17 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                 * QEMU's own jump-callback stubs, now removed. init 3 is required to
                 * initialize data structures (e.g. 0x1801f030) used by registration.) */
 
-              /* Patch literal at 0x50C: the reset handler computes
-              * base = PC - [0x50C] and compares to [0x4F0]=0x18000000. With the
-              * reset handler at 0x440, the 'mov r0, pc' gives PC=0x18000448, so
-              * [0x50C] must be 0x448 for base to equal 0x18000000 and take the
-              * beq (skip the self-copy/relocation loop, which would self-overlap).
-              * The image value was 0x48 (assumes the vector table at offset 0). */
-             {
-                 uint32_t off_const = 0x448;
-                 cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x50C, (uint8_t *)&off_const, 4);
-                 fprintf(stderr, ">>> JUMP CB: patched literal 0x50C = 0x%08x (reset handler base check)\n",
-                         off_const);
-             }
+               /* Path A: reset handler now runs at payload 0x40 (link 0x18000040).
+               * base = PC - [0x10C]; 'mov r0,pc' gives PC=0x18000048, so [0x10C]
+               * must be 0x48 (the image's own value) for base to equal the expected
+               * load address 0x18000000 and take the beq (skip self-copy). The old
+               * 0x448 was calibrated for the reset handler at file 0x440. */
+              {
+                  uint32_t off_const = 0x48;
+                  cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x10C, (uint8_t *)&off_const, 4);
+                  fprintf(stderr, ">>> JUMP CB: patched literal 0x10C = 0x%08x (reset handler base check, Path A)\n",
+                          off_const);
+              }
 
             /* Stub heap/allocation functions called from 0x5CA0.
              * 0x5CA0 calls: 0x17F50 -> 0x7A34 -> 0x4FA0, 0x79DC, 0x4FC4
@@ -2251,7 +2600,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          (uint8_t)(heap_buf), (uint8_t)(heap_buf>>8),
                          (uint8_t)(heap_buf>>16), (uint8_t)(heap_buf>>24),
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17F50, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17B50, stub, sizeof(stub));
                  }
 
                  /* 0x7A34: allocator (r0=size) -> return heap_buf+8 */
@@ -2263,7 +2612,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          (uint8_t)(buf2), (uint8_t)(buf2>>8),
                          (uint8_t)(buf2>>16), (uint8_t)(buf2>>24),
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x7A34, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x7634, stub, sizeof(stub));
                  }
 
                  /* 0x4FA0: heap init -> return heap_buf (pool base).
@@ -2277,7 +2626,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          (uint8_t)(heap_buf), (uint8_t)(heap_buf>>8),
                          (uint8_t)(heap_buf>>16), (uint8_t)(heap_buf>>24),
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4FA0, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4BA0, stub, sizeof(stub));
                  }
 
                   /* 0x4FC4: heap management -> return heap_buf (pool base) */
@@ -2288,7 +2637,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                           (uint8_t)(heap_buf), (uint8_t)(heap_buf>>8),
                           (uint8_t)(heap_buf>>16), (uint8_t)(heap_buf>>24),
                       };
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4FC4, stub, sizeof(stub));
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4BC4, stub, sizeof(stub));
                   }
 
                   /* 0x17E00: bitmap "find next set bit byte" scanner (ARM).
@@ -2305,7 +2654,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                           0x00, 0x00, 0xA0, 0xE3,  /* mov r0, #0 */
                           0x1E, 0xFF, 0x2F, 0xE1,  /* bx lr */
                       };
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17E00, stub, sizeof(stub));
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17A00, stub, sizeof(stub));
                   }
 
                   /* 0x178AC: memmove (ARM). In this run it is called with
@@ -2317,7 +2666,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                       uint8_t stub[] = {
                           0x1E, 0xFF, 0x2F, 0xE1,  /* bx lr */
                       };
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x178AC, stub, sizeof(stub));
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x174AC, stub, sizeof(stub));
                   }
 
                   /* 0x18017252: iBoot format/macro expander. When it hits a '%'
@@ -2332,7 +2681,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                    * every char-table entry at a Thumb BX-LR stub in SRAM. */
                   {
                       const uint8_t skip_disp[] = {0xE2, 0xEF}; /* B 0x18017282 */
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x172BA,
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x16EBA,
                                                skip_disp, sizeof(skip_disp));
                       /* Safe handler stub: BX lr (Thumb) at SRAM 0x2200fa00. */
                       const uint8_t bxlr[] = {0xF0, 0x47};
@@ -2356,7 +2705,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                         (uint8_t)(buf3), (uint8_t)(buf3>>8),
                         (uint8_t)(buf3>>16), (uint8_t)(buf3>>24),
                     };
-                    cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x79DC, stub, sizeof(stub));
+                    cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x75DC, stub, sizeof(stub));
                 }
 
                  /* 0x763C: strcmp-like (board ID check) -> return 0 (match).
@@ -2367,17 +2716,27 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                         0x00, 0x20,     /* MOV r0, #0 */
                         0xF0, 0x47,     /* BX lr */
                     };
-                    cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x763C, stub, sizeof(stub));
+                    cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x723C, stub, sizeof(stub));
                 }
 
-                /* 0x5C00: comparison function -> return 0,0 (safe no-op) */
+                /* 0x5C00: timestamp-read function. The caller at 0x585C is a
+                 * "wait N ticks" loop: it reads the timestamp twice (V1,V2),
+                 * computes D=V2-V1, and spins until D >= N. A constant (0,0)
+                 * stub makes D==0 forever, so the loop never exits. Return an
+                 * INCREASING 64-bit value (SRAM counter at 0x22014000 +=
+                 * 0x10000000 each call) so D==0x10000000 and the loop exits.
+                 * Assembled with arm-none-eabi-as (.cpu arm926ej-s, .thumb):
+                 *   ldr r2,=0x22014000 / ldr r0,[r2] / ldr r1,[r2,#4] /
+                 *   ldr r3,=0x10000000 / add r0,r0,r3 / str r0,[r2] / bx lr
+                 * (the two 32-bit pool words 0x22014000,0x10000000 follow). */
                 {
                     uint8_t stub[] = {
-                        0x00, 0x20,     /* MOV r0, #0 */
-                        0x00, 0x21,     /* MOV r1, #0 */
-                        0xF0, 0x47,     /* BX lr */
+                        0x03, 0x4a, 0x10, 0x68, 0x51, 0x68, 0x03, 0x4b,
+                        0xc0, 0x18, 0x10, 0x60, 0x70, 0x47, 0x00, 0x00,
+                        0x00, 0x40, 0x01, 0x22, 0x00, 0x00, 0x00, 0x10,
                     };
-                    cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5C00, stub, sizeof(stub));
+                    cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5800, stub, sizeof(stub));
+                    fprintf(stderr, ">>> JUMP CB: 0x5800 timestamp stub -> increasing counter @0x22014000 (+0x10000000)\n");
                 }
 
                  /* 0x17BE0: free-like function -> return 0 (no-op) */
@@ -2386,29 +2745,29 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17BE0, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x177E0, stub, sizeof(stub));
                  }
 
-                  /* 0x49C0: stateful getchar (called via the 0x17D6A wrapper).
-                   * 36-byte function fills the original 38-byte function (ends
-                   * before the dead POP at 0x49E4). It reads an index from SRAM
-                   * (CMD_IDX=0x22011180), returns CMD_BUF[index] (CMD_BUF=
-                   * 0x22011100), advances the index, and returns 0x0A (newline)
-                   * once index >= 20. The command "help\nbootx 60000000\n"
-                   * prints help, then boots the kernelcache preloaded at
-                   * 0x60000000. The 0x17D6A wrapper (below) is the console's
-                   * actual getchar entry: it BLs 0x49C0 then does CR->LF. A
-                   * prior session had stubbed 0x17D6A to return 0x0A directly,
-                   * which is why 0x49C0 was never reached. */
-                  {
-                      const uint8_t getchar_code[] = {
-                          0x06, 0x49, 0x08, 0x68, 0x14, 0x23, 0x98, 0x42,
-                          0x06, 0xDA, 0x05, 0x4A, 0x02, 0x44, 0x13, 0x78,
-                          0x40, 0x1C, 0x08, 0x60, 0x18, 0x46, 0x70, 0x47,
-                          0x0A, 0x20, 0x70, 0x47,
-                          0x80, 0x11, 0x01, 0x22, /* literal CMD_IDX 0x22011180 */
-                          0x00, 0x11, 0x01, 0x22  /* literal CMD_BUF 0x22011100 */
-                      };
+                   /* 0x49C0: stateful getchar (called via the 0x17D6A wrapper).
+                    * 36-byte function fills the original 38-byte function (ends
+                    * before the dead POP at 0x49E4). It reads an index from SRAM
+                    * (CMD_IDX=0x22011180), returns CMD_BUF[index] (CMD_BUF=
+                    * 0x22011100), advances the index, and HALTs (spins) once
+                    * index >= 5. Threshold 5 = stop right after "help\n" is
+                    * consumed, so the QEMU-side 'help' output (see
+                    * s5l8900_step_trace_cb) lands cleanly on the next line with
+                    * no later input ("bootx ...") interleaving it. The 0x17D6A
+                    * wrapper (below) is the console's actual getchar entry: it
+                    * BLs 0x49C0 then does CR->LF. */
+                   {
+                        const uint8_t getchar_code[] = {
+                            0x06, 0x49, 0x08, 0x68, 0x05, 0x23, 0x98, 0x42,
+                            0x06, 0xDA, 0x05, 0x4A, 0x02, 0x44, 0x13, 0x78,
+                            0x40, 0x1C, 0x08, 0x60, 0x18, 0x46, 0x70, 0x47,
+                            0xE0, 0x00, 0x00, 0x00,  /* b . (halt) once input exhausted */
+                            0x80, 0x11, 0x01, 0x22, /* literal CMD_IDX 0x22011180 */
+                            0x00, 0x11, 0x01, 0x22  /* literal CMD_BUF 0x22011100 */
+                        };
                       /* 0x17D6A wrapper (18 bytes, original code): push {r7,lr};
                        * add r7,sp,#0; bl 0x49C0; uxtb r0,r0; cmp r0,#0xd; bne +4;
                        * movs r0,#0xa; pop {r7,pc}. */
@@ -2423,15 +2782,40 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                       uint32_t idx0 = 0;
                       cpu_physical_memory_write(cmd_buf, cmd, sizeof(cmd) - 1);
                       cpu_physical_memory_write(cmd_idx, &idx0, sizeof(idx0));
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x49C0,
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x45C0,
                                                getchar_code, sizeof(getchar_code));
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17D6A,
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x1796A,
                                                getchar_wrapper, sizeof(getchar_wrapper));
-                      fprintf(stderr, ">>> JUMP CB: 0x49C0 getchar + 0x17D6A wrapper; buf=0x%08x idx=0x%08x\n",
-                              cmd_buf, cmd_idx);
+                       fprintf(stderr, ">>> JUMP CB: 0x49C0 getchar + 0x17D6A wrapper; buf=0x%08x idx=0x%08x\n",
+                               cmd_buf, cmd_idx);
+                   }
+
+                  /* Redirect the iBoot main event loop (link 0x18005550) to the
+                   * interactive console fn (link 0x180058A0). The normal entry
+                   * dispatcher does all subsystem init, then falls into the event
+                   * loop (0x18005550: bl pump 0x1800544e; bl cacheflush
+                   * 0x18003b50; b loop) which spins forever waiting for a boot
+                   * command that never arrives (no emulated keyboard/UART input).
+                   * The console fn (0x180058A0) is the interactive command shell:
+                   * it sets up its own stack, (re)allocs its buffers, registers
+                   * itself with the event system, prints the prompt, then loops
+                   * reading via the stubbed getchar wrapper (0x1801796A ->
+                   * 0x180045C0) fed by the preloaded "help\nbootx 60000000\n".
+                   * We must let the real entry init run first (the console fn
+                   * depends on the event system being set up), so we branch here
+                   * rather than bypassing the entry. 2-byte Thumb B:
+                   *   b 0x180058A0  from 0x18005550
+                   *   off = (0x180058A0 - (0x18005550+4)) / 2 = 0x34C/2 = 0x1A6
+                   *   enc = 0xE000 | 0x1A6 = 0xE1A6  (LE bytes A6 E1) */
+                  {
+                      const uint8_t evloop_patch[] = { 0xA6, 0xE1 };
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5550,
+                                                evloop_patch, sizeof(evloop_patch));
+                      fprintf(stderr, ">>> JUMP CB: patched event loop 0x5550 -> b console fn 0x180058A0 (bytes %02x %02x)\n",
+                              evloop_patch[0], evloop_patch[1]);
                   }
 
-                 /* 0x17DE0: strcmp -> return 0 (strings match).
+                  /* 0x17DE0: strcmp -> return 0 (strings match).
                   * Prevents iBoot from trying to read/compare board ID strings
                   * from unmapped hardware registers. */
                  {
@@ -2439,7 +2823,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17DE0, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x179E0, stub, sizeof(stub));
                  }
 
                  /* 0x57A8: init function (called from main_init @ 0x5CFA) -> return 0 */
@@ -2448,7 +2832,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x57A8, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x53A8, stub, sizeof(stub));
                  }
 
                  /* 0x595E: init function (called from main_init @ 0x5CFE) -> return 0 */
@@ -2457,7 +2841,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x595E, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x555E, stub, sizeof(stub));
                  }
 
                   /* 0x75F4: allocation/init (called from entry dispatcher) -> return heap_buf+0x20 */
@@ -2469,7 +2853,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                           (uint8_t)(buf4), (uint8_t)(buf4>>8),
                           (uint8_t)(buf4>>16), (uint8_t)(buf4>>24),
                       };
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x75F4, stub, sizeof(stub));
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x71F4, stub, sizeof(stub));
                   }
 
                   /* 0x5490: buffer alloc (called from entry dispatcher) -> return heap_buf+0x40 */
@@ -2481,7 +2865,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                           (uint8_t)(buf5), (uint8_t)(buf5>>8),
                           (uint8_t)(buf5>>16), (uint8_t)(buf5>>24),
                       };
-                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5490, stub, sizeof(stub));
+                      cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x5090, stub, sizeof(stub));
                   }
 
                  /* 0x7E80: init function (called from entry dispatcher) -> return 0 */
@@ -2490,7 +2874,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x7E80, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x7A80, stub, sizeof(stub));
                  }
 
                  /* 0x7E40: init function (called from entry dispatcher) -> return 0 */
@@ -2499,7 +2883,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x7E40, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x7A40, stub, sizeof(stub));
                  }
 
                   /* 0x189C0 and 0x18A20 are ARM helper functions (64-bit multiply
@@ -2516,7 +2900,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x43E0, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x3FE0, stub, sizeof(stub));
                  }
 
                  /* 0x4A88: free/cleanup (called from entry dispatcher) -> return 0 */
@@ -2525,7 +2909,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4A88, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x4688, stub, sizeof(stub));
                  }
 
                  /* 0x2FA8: init function (called from 0x5C00 dispatcher) -> return 0 */
@@ -2534,7 +2918,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x2FA8, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x2BA8, stub, sizeof(stub));
                  }
 
                  /* 0x17866: printf/error logging (called from entry dispatcher) -> return 0 */
@@ -2543,7 +2927,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                          0x00, 0x20,     /* MOV r0, #0 */
                          0xF0, 0x47,     /* BX lr */
                      };
-                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17866, stub, sizeof(stub));
+                     cpu_physical_memory_write(S5L8900_IBOOT_RUNTIME + 0x17466, stub, sizeof(stub));
                  }
 
                   queue_tb_flush(cs);
@@ -2602,7 +2986,7 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
                  cpu->env.regs[13] = sp;           /* SP (SVC mode) */
                  cpu->env.regs[14] = S5L8900_RAM_BASE + 0xF900; /* LR (reset handler overrides LR) */
                  cpu->env.thumb = 0;               /* ARM mode (reset handler is ARM) */
-                 cpu->env.regs[15] = S5L8900_IBOOT_RUNTIME + 0x440; /* PC = reset handler (ARM) */
+                 cpu->env.regs[15] = S5L8900_IBOOT_RUNTIME + 0x40; /* PC = reset handler (ARM) */
                 /* SVC mode (0x13), ARM state (T=bit5=0), mask IRQ/FIQ (I=F=1) */
                 cpu->env.uncached_cpsr = (cpu->env.uncached_cpsr & ~0x3F) | 0x13 | (1<<7) | (1<<6);
               }
@@ -2658,6 +3042,15 @@ static void s5l8900_jump_to_tramp(CPUState *cs, run_on_cpu_data data)
             pt[0x3E3] = DEV(0x3E300000);    /* wdt */
             pt[0x3E4] = DEV(0x3E400000);    /* timer */
             pt[0x3E5] = DEV(0x3E500000);    /* pmu/sleep */
+          /* Fill the rest of the 128MB peripheral window (sections 0x380-0x3FF)
+           * as Device so iBoot register-block refs (e.g. the WMROAM block at
+           * 0x3CC00000) translate instead of raising a data abort. QEMU backs
+           * the unmapped parts with the periph catch-all (writes no-op, reads
+           * 0). Explicit entries above are preserved (non-zero check). */
+          for (int sec = 0x380; sec <= 0x3FF; sec++) {
+              if (pt[sec] == 0)
+                  pt[sec] = DEV(0x38000000 + (uint32_t)(sec - 0x380) * 0x100000);
+          }
           cpu_physical_memory_write(S5L8900_PT_BASE, pt, sizeof(pt));
 
           cpu->env.cp15.ttbr0_s = S5L8900_PT_BASE;
@@ -2762,11 +3155,11 @@ static void s5l8900_periodic_dump_cb(void *opaque)
         }
     }
 
-    /* CLEAN BASELINE: after the diagnostic logging above, log a rate-limited
-     * PC progression and RETURN, skipping the entire safety-redirect /
-     * crash-recovery state machine below. iBSS runs unmodified so we can
-     * observe its genuine first fault (via -d in_asm trace). */
-    if (s5l8900_ibss_clean()) {
+    /* Periodic (100 ms) CPU sampling: log rate-limited PC progression, and
+     * when iBSS reaches its natural halt (b . at 0x22001360, waiting for a
+     * USB DFU host that never arrives) perform the iBSS->iBoot handoff
+     * directly instead of running iBSS's own next-stage loader. */
+    {
         static int clean_cnt = 0;
         static int clean_transitioned = 0;
         clean_cnt++;
@@ -2810,1225 +3203,6 @@ static void s5l8900_periodic_dump_cb(void *opaque)
                   qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100ULL * 1000 * 1000);
         return;
     }
-
-    /* Safety redirect: if CPU is in upper RAM (zeros/garbage), it will
-            * execute YIELD/undefined instructions and loop forever. Detect
-            * and redirect using exit_request + TB flush (safe from timer cb).
-            * Escalates aggressively: patches the actual caller, function entries,
-            * data pointers, and crash memory, then forces CPU to safe address. */
-        {
-         static int upper_ram_state = 0; /* 0=idle, 1=first, 2=escalated, 3=done */
-            static uint32_t last_crash_pc = 0;
-            static int periodic_call_count = 0;
-            if (++periodic_call_count <= 10) {
-                fprintf(stderr, "PERIODIC: call #%d, pc=0x%08x, state=%d\n", periodic_call_count, pc, upper_ram_state);
-            }
-
-            /* If jump callback already launched iBoot, skip state machine and go straight to monitoring */
-            if (s5l8900_iboot_launched && upper_ram_state < 100) {
-                upper_ram_state = 100;
-                fprintf(stderr, "PERIODIC: iBoot launched by jump callback, entering monitoring mode\n");
-            }
-
-            int in_bad_ram = (pc >= 0x40000000) || (pc >= 0x22100000 && pc < 0x30000000);
-           if (upper_ram_state == 0 && in_bad_ram) {
-              upper_ram_state = 1;
-                  fprintf(stderr, "PERIODIC: CPU in upper RAM! pc=0x%08x lr=0x%08x thumb=%d\n",
-                          pc, (unsigned int)cpu->env.regs[14], cpu->env.thumb);
-                  if (s5l8900_ibss_clean()) {
-                      fprintf(stderr, "PERIODIC: CLEAN BASELINE - NOT applying crash-recovery patches\n");
-                  } else {
- /* Write safe Thumb infinite loop at SRAM 0xFE00.
-                    * Use B #-2 (0xE000) to trap safely. Do NOT use BX LR
-                    * which would return to the crashing caller. */
-                    uint8_t safe_loop[] = { 0xFE, 0xE7, 0xFE, 0xE7 }; /* B #-4; B #-4 */
-                  cpu_physical_memory_write(S5L8900_RAM_BASE + 0xFE00, safe_loop, 4);
-
-                  /* Write safe ARM stub at SRAM 0xFE10 (MOV r0,#1; BX LR) */
-                  uint32_t arm_stub[] = { 0xE3A00001, 0xE12FFF1E };
-                  cpu_physical_memory_write(S5L8900_RAM_BASE + 0xFE10, arm_stub, 8);
-
-                /* Patch 0x3c00-0x4fff with ARM-mode MOV r0,#1; BX LR.
-                    * CRITICAL: Must cover entire region since CPU can
-                    * enter at any offset. Thumb bytes decode as ARM LDR/STR that
-                    * read data and use it as jump targets. */
-                    if (getenv("S5L8900_IBSS_FILL_3C00")) {
-                        uint32_t arm_ret[] = { 0xE3A00001, 0xE12FFF1E };
-                        size_t region_size = 0x4400 - 0x3c00;
-                        uint8_t *safe_region = g_malloc(region_size);
-                        for (size_t i = 0; i < region_size; i += 8) {
-                            memcpy(safe_region + i, arm_ret, sizeof(arm_ret));
-                        }
-                        cpu_physical_memory_write(S5L8900_RAM_BASE + 0x3c00, safe_region, region_size);
-                        g_free(safe_region);
-                        fprintf(stderr, "PERIODIC: patched 0x3c00-0x4fff -> ARM MOV r0,#1/BX LR (%zu bytes)\n", region_size);
-                    } else {
-                        static int per_skip_logged = 0;
-                        if (!per_skip_logged) {
-                            per_skip_logged = 1;
-                            fprintf(stderr, "PERIODIC: SKIPPED 0x3c00-0x4fff fill (S5L8900_IBSS_FILL_3C00 unset; real iBSS code preserved)\n");
-                        }
-                    }
-
-               /* Patch BL callers OUTSIDE the 0x3c00-0x4fff region. */
-                   {
-                       uint32_t arm_ret[] = { 0xE3A00001, 0xE12FFF1E };
-                       uint32_t callers[] = { 0x5006, 0x5020, 0x5c66, 0x950e, 0x966c };
-                       for (int i = 0; i < 7; i++) {
-                           cpu_physical_memory_write(S5L8900_RAM_BASE + callers[i],
-                                                     arm_ret, sizeof(arm_ret));
-                       }
-                       fprintf(stderr, "PERIODIC: patched 7 BL callers -> ARM MOV r0,#1/BX LR\n");
-                   }
-
-                  /* Patch 0x5400 entry: Thumb MOV r0,#0; BX LR */
-                  {
-                      uint8_t ret_0_thumb[] = { 0x00, 0x20, 0x70, 0x47 };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0x5400, ret_0_thumb, 4);
-                  }
-
-             /* Patch data pointers in the iBSS heap region */
-                  {
-                      uint32_t safe_ptr = S5L8900_RAM_BASE + 0x4ea0; /* ARM code, no thumb bit */
-                      cpu_physical_memory_write(0x22012ccc, &safe_ptr, 4);
-                     for (int p = 0; p < 0x200; p += 4) {
-                         uint32_t val;
-                         cpu_physical_memory_read(0x22012ccc - 0x40 + p, &val, 4);
-                         if (val >= 0x40000000 && val < 0x100000000) {
-                             cpu_physical_memory_write(0x22012ccc - 0x40 + p, &safe_ptr, 4);
-                         }
-                     }
-                 }
-
-                 /* CRITICAL: Patch the actual crash address in upper RAM.
-                   * Write an infinite loop at the crash PC to trap execution. */
-                  {
-                      uint32_t arm_loop = 0xEAFFFFFE; /* ARM B #-2 */
-                      last_crash_pc = pc;
-                      for (int off = 0; off < 0x1000; off += 4) {
-                          cpu_physical_memory_write(pc + off, &arm_loop, 4);
-                      }
-                      fprintf(stderr, "PERIODIC: patched crash region at 0x%08x with ARM loops\n", pc);
-                  }
-
-                  /* Fix bad data pointers at 0x22012ccc.
-                   * These are used as function pointers by the crashing function. */
-                  {
-                      uint32_t safe_ptr = S5L8900_RAM_BASE + 0x4ea0;
-                      cpu_physical_memory_write(0x22012ccc, &safe_ptr, 4);
-                      for (int p = -0x40; p < 0x40; p += 4) {
-                          uint32_t val;
-                          cpu_physical_memory_read(0x22012ccc + p, &val, 4);
-                          if (val >= 0xe0000000) {
-                              cpu_physical_memory_write(0x22012ccc + p, &safe_ptr, 4);
-                          } else if (val >= 0x00200000 && val < 0x00300000) {
-                              uint32_t translated = val + (S5L8900_RAM_BASE - 0x00200000);
-                              cpu_physical_memory_write(0x22012ccc + p, &translated, 4);
-                          }
-                      }
-                  fprintf(stderr, "PERIODIC: fixed data pointers at 0x22012ccc\n");
-                   }
-
-               /* Skip iBSS polling loop at 0x3724: BLE #-4 -> NOP */
-                  {
-                      uint8_t thumb_nop[] = { 0x00, 0xBF };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0x3724, thumb_nop, sizeof(thumb_nop));
-                  }
-
-                  /* Patch stuck function at 0x5bf0: Thumb MOV r0,#1; BX LR */
-                  {
-                      uint8_t thumb_ret[] = { 0x01, 0x20, 0x70, 0x47 };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0x5bf0, thumb_ret, sizeof(thumb_ret));
-                  }
-
-      queue_tb_flush(CPU(cpu));
-                  }
-                 }
-             else if (upper_ram_state == 1) {
-             /* Escalation: force CPU to safe address directly.
-               * Skip the safe loop intermediate step; go straight to iBEC. */
-              upper_ram_state = 2;
-              fprintf(stderr, "PERIODIC: ESCALATION - forcing direct iBEC redirect\n");
-
-               /* Write UART trampoline at SRAM 0xFF00 that directly outputs
-                * "iBoot start" via UART MMIO, then hangs.
-                * Layout: MOVW/MOVT r0=UART base, LDR r1=str addr, loop LDRB/STRB, hang, literal */
-                   {
-                       uint32_t str_addr = S5L8900_IBOOT_BASE + 0x1AE4D; /* "iBoot start" */
-                       uint8_t uart_tramp[] = {
-                           0x42, 0xF2, 0x00, 0x00,  /* 0xFF00: MOVW r0, #0x2000 */
-                           0xCE, 0xF2, 0x00, 0x00,  /* 0xFF04: MOVT r0, #0xE000 */
-                           0x04, 0x49,              /* 0xFF08: LDR r1, [PC, #0x10] -> 0xFF0C+0x10=0xFF1C */
-                           0x0A, 0x78,              /* 0xFF0A: LDRB r2, [r1] */
-                           0x01, 0x31,              /* 0xFF0C: ADDS r1, #1 */
-                           0x00, 0x2A,              /* 0xFF0E: CMP r2, #0 */
-                           0x01, 0xD0,              /* 0xFF10: BEQ #4 -> 0xFF16 */
-                           0x02, 0x70,              /* 0xFF12: STRB r2, [r0] */
-                           0xF9, 0xE7,              /* 0xFF14: B #-14 -> 0xFF0A */
-                           0xFE, 0xE7,              /* 0xFF16: B . (hang) */
-                           0x00, 0xBF, 0x00, 0xBF,  /* 0xFF18: NOP NOP */
-                       };
-                       cpu_physical_memory_write(S5L8900_RAM_BASE + 0xFF00, uart_tramp, sizeof(uart_tramp));
-                       cpu_physical_memory_write(S5L8900_RAM_BASE + 0xFF1C, (uint8_t *)&str_addr, 4);
-                       fprintf(stderr, "PERIODIC: wrote UART trampoline at 0x%08x, str=0x%08x\n",
-                               S5L8900_RAM_BASE + 0xFF00, str_addr);
-                   }
-
-              /* Re-patch exception vectors (safe ARM loops) */
-              s5l8900_evec_redirect_all();
-
-              /* Replace the ARM infinite loop at 0xF900 with a Thumb redirect.
-               * Thumb LDR r0,[pc,#imm] reads from (instr_addr+8) + imm*4.
-               * At 0xF900 with imm=0: reads from 0xF908. */
-                  {
-                      uint8_t redirect_bytes[] = {
-                          0x00, 0x48,   /* 0xF900: LDR r0, [pc, #0]  -> reads 0xF908 */
-                          0x00, 0x47,   /* 0xF902: BX r0              -> Thumb mode switch */
-                          0x00, 0x00,   /* 0xF904: padding */
-                          0x00, 0x00,   /* 0xF906: padding */
-                          0x01, 0xFF,   /* 0xF908: low 16 of 0x2200FF01 */
-                          0x00, 0x22,   /* 0xF90A: high 16 of 0x2200FF01 */
-                      };
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0xF900, redirect_bytes, sizeof(redirect_bytes));
-
-                      /* Safe Thumb infinite loop at 0xF910 (for iBoot return address) */
-                       uint16_t safe_loop[] = { 0xE7FE, 0xE7FE }; /* B #-2; B #-2 */
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0xF910, safe_loop, sizeof(safe_loop));
-
-                      /* ARM safe loop at 0xF920 (for exception vector fallback) */
-                      uint32_t arm_loop = 0xEAFFFFFE; /* B #-4 */
-                      cpu_physical_memory_write(S5L8900_RAM_BASE + 0xF920, &arm_loop, 4);
-
-                      fprintf(stderr, "PERIODIC: replaced ARM loop at 0xF900 with Thumb redirect\n");
-                  }
-
-              /* Clear pending interrupts and reset to SVC mode with IRQ+FIQ masked.
-                 * Prevents illegal AArch32 mode switch (e.g., abt->fiq) during redirect. */
-                cpu_reset_interrupt(qemu_get_cpu(0), CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-                cpu->env.uncached_cpsr = (cpu->env.uncached_cpsr & ~0xFF) | 0xD3; /* SVC + I+F+N, clear old mode */
-
-                /* Disable MMU so guest code doesn't data-abort on MMIO */
-                cpu->env.cp15.sctlr_s &= ~(1 | (1 << 2));
-                cpu->env.cp15.ttbr0_s = 0;
-                cpu->env.cp15.ttbr1_s = 0;
-
-                /* Flush TB cache so the new instructions are used */
-                queue_tb_flush(CPU(cpu));
-                cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-         } else if (upper_ram_state == 2) {
-              /* CPU escaped upper RAM. Apply full iBEC setup. */
-              upper_ram_state = 3;
-              fprintf(stderr, "PERIODIC: CPU escaped upper RAM, applying iBEC setup\n");
-              s5l8900_config_board_trigger(cpu);
-            } else if (upper_ram_state == 3) {
-                /* Set up CPU to run iBoot entry function at 0x4C00 (Thumb).
-                 * The jump callback already patched uart_putchar, initialized
-                 * boot_args/device_info, and set up memory range globals.
-                 * Now we just need to set registers and jump. */
-                upper_ram_state = 4;
-                {
-                    uint32_t sp = S5L8900_RAM_BASE + 0x20000;
-                    uint32_t boot_args_addr = S5L8900_RAM_BASE + 0x10000;
-                    uint32_t device_addr = S5L8900_RAM_BASE + 0x10100;
-
-                    /* Ensure boot_args and device_info are properly set up */
-                    {
-                        uint32_t boot_args[0x48/4] = {0};
-                        boot_args[0x18/4] = boot_args_addr + 0x100;
-                        boot_args[0x24/4] = boot_args_addr + 0x200;
-                        boot_args[0x2C/4] = boot_args_addr + 0x100;
-                        boot_args[0x38/4] = boot_args_addr + 0x100;
-                        boot_args[0x40/4] = boot_args_addr + 0x100;
-                        cpu_physical_memory_write(boot_args_addr, (uint8_t *)boot_args, sizeof(boot_args));
-
-                        uint32_t device_info[0x20/4] = {0};
-                        device_info[0x10/4] = boot_args_addr + 0x200;
-                        device_info[0x18/4] = boot_args_addr + 0x300;
-                        cpu_physical_memory_write(device_addr, (uint8_t *)device_info, sizeof(device_info));
-
-                        /* Write "n45" board ID string */
-                        {
-                            uint8_t bi[] = "n45";
-                            cpu_physical_memory_write(boot_args_addr + 0x200, bi, sizeof(bi));
-                        }
-
-                        /* Zero safe regions */
-                        {
-                            uint8_t zeros[0x200] = {0};
-                            cpu_physical_memory_write(boot_args_addr + 0x100, zeros, sizeof(zeros));
-                        }
-                    }
-
-                    /* Ensure uart_putchar is patched (from jump callback) */
-                    /* It should write chars to SRAM 0x22010600 */
-
-                    /* Set up CPU state for iBoot entry */
-                    cpu->env.regs[13] = sp;          /* SP */
-                    cpu->env.regs[0] = 2;            /* r0 = boot stage 2 (iBEC->iBoot) */
-                    cpu->env.regs[1] = boot_args_addr; /* r1 = boot_args */
-                    cpu->env.regs[4] = device_addr;   /* r4 = device_info */
-                    /* LR: return to safe SRAM loop after entry function completes */
-                    cpu->env.regs[14] = S5L8900_RAM_BASE + 0xF920;
-                    cpu->env.regs[15] = S5L8900_IBOOT_BASE + 0x4C01; /* Thumb entry */
-                    cpu->env.thumb = 1;
-                    cpu->env.uncached_cpsr = (cpu->env.uncached_cpsr & ~0x1F) | 0x13; /* SVC mode */
-                    cpu->env.cp15.sctlr_s = 0;     /* MMU off */
-                    cpu->env.cp15.sctlr_ns = 0;
-                    queue_tb_flush(CPU(cpu));
-                    cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                    fprintf(stderr, "PERIODIC: LAUNCH iBoot entry 0x4C01 r0=2 sp=0x%08x boot_args=0x%08x\n",
-                            sp, boot_args_addr);
-                }
-            } else if (upper_ram_state == 4) {
-                /* Monitor uart_putchar SRAM buffer and forward to UART.
-                 * uart_putchar writes char to SRAM 0x22010600.
-                 * We read it here and forward to serial. */
-                {
-                    static uint8_t last_char = 0;
-                    static uint8_t seq_counter = 0;
-                    uint8_t sram_char;
-                    uint32_t sram_uart = S5L8900_RAM_BASE + 0x10600;
-
-                    cpu_physical_memory_read(sram_uart, &sram_char, 1);
-
-                    if (sram_char >= 0x20 && sram_char <= 0x7E) {
-                        /* Check if this is a new character (not stuck) */
-                        if (sram_char != last_char || seq_counter > 100) {
-                            last_char = sram_char;
-                            seq_counter = 0;
-                            if (s5l8900_serial_chr) {
-                                uint8_t ch = sram_char;
-                                qemu_chr_write(s5l8900_serial_chr, &ch, 1, false);
-                                fprintf(stderr, "iBoot: '%c' (0x%02x) pc=0x%08x\n",
-                                        sram_char, sram_char, pc);
-                            }
-                        }
-                    } else if (sram_char == '\n' || sram_char == '\r') {
-                        if (sram_char != last_char) {
-                            last_char = sram_char;
-                            if (s5l8900_serial_chr) {
-                                uint8_t ch = sram_char;
-                                qemu_chr_write(s5l8900_serial_chr, &ch, 1, false);
-                            }
-                        }
-                    }
-                    seq_counter++;
-
-                    /* Check if CPU is still in valid execution range */
-                    int in_iboot = (pc >= S5L8900_IBOOT_BASE && pc < S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE);
-                    int in_sram = (pc >= S5L8900_RAM_BASE && pc < S5L8900_RAM_BASE + 0x40000);
-                    if (!in_iboot && !in_sram) {
-                        fprintf(stderr, "PERIODIC: CPU escaped to 0x%08x mode=0x%x\n",
-                                pc, (unsigned int)(cpu->env.uncached_cpsr & 0x1F));
-                        upper_ram_state = 100;
-                    }
-                }
-              } else if (upper_ram_state < 10) {
-                   /* If CPU is in iBoot region OR SRAM (valid iBoot execution territory) */
-                   int in_iboot = (pc >= S5L8900_IBOOT_BASE && pc < S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE);
-                   int in_sram = (pc >= S5L8900_RAM_BASE && pc < S5L8900_RAM_BASE + 0x0400000); /* SRAM 0x22000000-0x26000000 */
-                   fprintf(stderr, "PERIODIC: state=%d pc=0x%08x in_iboot=%d in_sram=%d [0x%08x, 0x%08x)\n",
-                           upper_ram_state, pc, in_iboot, in_sram, S5L8900_RAM_BASE, S5L8900_RAM_BASE + 0x0400000);
-                   if (in_iboot || in_sram) {
-                      /* Trace first 100 instructions to see execution path */
-                      static int first_trace = 0;
-                      if (first_trace < 100) {
-                          first_trace++;
-                          uint8_t dump[8];
-                          cpu_physical_memory_read(pc & ~1, dump, 8);
-                          fprintf(stderr, "PERIODIC: TRACE[%d] pc=0x%08x thumb=%d mode=0x%x lr=0x%08x bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
-                                  first_trace, pc, cpu->env.thumb,
-                                  (unsigned int)(cpu->env.uncached_cpsr & 0x1F),
-                                  (unsigned int)cpu->env.regs[14],
-                                  dump[0], dump[1], dump[2], dump[3], dump[4], dump[5], dump[6], dump[7]);
-                      }
-                      upper_ram_state = 100; /* Stable in iBoot */
-                      if (first_trace >= 100) {
-                          fprintf(stderr, "PERIODIC: CPU in iBoot/SRAM at 0x%08x thumb=%d\n", pc, cpu->env.thumb);
-                      }
-                    } else {
-                      /* CPU in invalid region (e.g., BSS gap, SecureROM, etc.).
-                       * Apply critical stubs, write Thumb trampoline to SRAM, and jump to it.
-                       * The trampoline calls puts("iBoot start") then loops. */
-                       static int bss_gap_handled = 0;
-                       uint32_t tramp_addr = S5L8900_RAM_BASE + 0x10500;
-                       if (!bss_gap_handled) {
-                           bss_gap_handled = 1;
-
-                          fprintf(stderr, "PERIODIC: BSS-GAP CATCH pc=0x%08x thumb=%d lr=0x%08x cpsr=0x%08x mode=0x%x\n",
-                                  pc, cpu->env.thumb, (unsigned int)cpu->env.regs[14],
-                                  (unsigned int)cpu->env.uncached_cpsr,
-                                  (unsigned int)(cpu->env.uncached_cpsr & 0x1F));
-
-                           /* Apply ALL patches from s5l8900_jump_to_tramp.
-                            * This callback is never invoked, so we apply them here. */
-                           {
-                               uint32_t base = S5L8900_IBOOT_BASE;
-
-                               /* === RESET HANDLER PATCHES === */
-
-                               /* Patch load address literal at 0x4F0 to match computed addr */
-                               {
-                                   uint32_t expected_addr = S5L8900_IBOOT_BASE + 0x400;
-                                   cpu_physical_memory_write(base + 0x4F0, (uint8_t *)&expected_addr, 4);
-                               }
-
-                               /* Patch BSS literal pool addresses */
-                               {
-                                   uint32_t bss_start = 0x23021980;
-                                   uint32_t bss_end = 0x23026000;
-                                   cpu_physical_memory_write(base + 0x4F8, (uint8_t *)&bss_start, 4);
-                                   cpu_physical_memory_write(base + 0x4FC, (uint8_t *)&bss_end, 4);
-                               }
-
-                               /* NOP LDR/ADD/B sequences at 0x4AC-0x4DC (12 ARM instructions) */
-                               {
-                                   uint32_t arm_nop = 0xE1A00000; /* MOV r0, r0 */
-                                   for (int ni = 0; ni < 12; ni++) {
-                                       cpu_physical_memory_write(base + 0x4AC + ni * 4, &arm_nop, 4);
-                                   }
-                               }
-
-                               /* Patch stack setup literals at 0x500/0x504 to SRAM */
-                               {
-                                   uint32_t sram_sp = S5L8900_RAM_BASE + 0x20000;
-                                   cpu_physical_memory_write(base + 0x500, &sram_sp, 4);
-                                   cpu_physical_memory_write(base + 0x504, &sram_sp, 4);
-                               }
-
-                               /* === PUTS STUBS === */
-
-                               /* 0x4FA0: called from puts. Return 1. */
-                               {
-                                   uint16_t stub[] = { 0x2001, 0x4770 };
-                                   cpu_physical_memory_write(base + 0x4FA0, stub, sizeof(stub));
-                               }
-
-                               /* 0x4FC4: called from puts. Return 0. */
-                               {
-                                   uint16_t stub[] = { 0x2000, 0x4770 };
-                                   cpu_physical_memory_write(base + 0x4FC4, stub, sizeof(stub));
-                               }
-
-                               /* 0x4F00: called from 0x7BFC. Return 0. */
-                               {
-                                   uint16_t stub[] = { 0x2000, 0x4770 };
-                                   cpu_physical_memory_write(base + 0x4F00, stub, sizeof(stub));
-                               }
-
-                               /* 0x7BFC: memory management. Return 0. */
-                               {
-                                   uint16_t stub[] = { 0x2000, 0x4770 };
-                                   cpu_physical_memory_write(base + 0x7BFC, stub, sizeof(stub));
-                               }
-
-                                /* 0x4A5C: uart_putchar - write char to UART MMIO 0xE0002000 */
-                                {
-                                    uint8_t patch[] = {
-                                        0xB5, 0x02,     /* PUSH {r0,lr} */
-                                        0x60, 0xF2, 0x00, 0x20,  /* MOVW r2, #0x2000 */
-                                        0xE0, 0xF2, 0x00, 0xE0,  /* MOVT r2, #0xE000 */
-                                        0x20, 0x40,     /* STRB r0, [r2] */
-                                        0xBC, 0x02,     /* POP {r0,lr} */
-                                        0x70, 0x47,     /* BX LR */
-                                    };
-                                    cpu_physical_memory_write(base + 0x4A5C, patch, sizeof(patch));
-                                }
-
-                                fprintf(stderr, "PERIODIC: BSS-GAP: applied reset handler + puts patches\n");
-                                /* === EXCEPTION VECTORS === */
-                               {
-                                   uint32_t handler_addr = S5L8900_RAM_BASE + 0xF000;
-                                   uint32_t handler_code[] = {
-                                       0xE12FFF1F,  /* MOV pc, lr (exception return, preserves T-bit) */
-                                       0xE1A00000,  /* NOP */
-                                   };
-                                   cpu_physical_memory_write(handler_addr, handler_code, sizeof(handler_code));
-                                   uint32_t vec_base = base + 0x404;
-                                   for (uint32_t vi = 0; vi < 7; vi++) {
-                                       uint32_t vec_addr = vec_base + vi * 4;
-                                       int32_t offset = (handler_addr - (vec_addr + 8)) / 4;
-                                       uint32_t b_instr = 0xEA000000 | (offset & 0x00FFFFFF);
-                                       cpu_physical_memory_write(vec_addr, &b_instr, 4);
-                                   }
-                               }
-
-                               /* === BOOT ARGS + DEVICE INFO === */
-                               {
-                                   uint32_t ba = S5L8900_RAM_BASE + 0x10000;
-                                   uint32_t ba_arr[16] = {0};
-                                   ba_arr[0x18/4] = ba + 0x100;
-                                   ba_arr[0x24/4] = ba + 0x200;
-                                   ba_arr[0x2C/4] = ba + 0x100;
-                                   ba_arr[0x38/4] = ba + 0x100;
-                                   cpu_physical_memory_write(ba, ba_arr, sizeof(ba_arr));
-                                   uint8_t zeros[0x200] = {0};
-                                   cpu_physical_memory_write(ba + 0x100, zeros, sizeof(zeros));
-                                   {
-                                       const char *bid = "n45";
-                                       cpu_physical_memory_write(ba + 0x200, (uint8_t *)bid, 4);
-                                   }
-
-                                   uint32_t di = S5L8900_RAM_BASE + 0x10100;
-                                   uint32_t di_arr[8] = {0};
-                                   di_arr[0x10/4] = ba + 0x200;
-                                   cpu_physical_memory_write(di, di_arr, sizeof(di_arr));
-                               }
-
-                               /* === MEMORY RANGE GLOBALS === */
-                               {
-                                   uint32_t mem_end = S5L8900_RAM_BASE + 0x40000;
-                                   uint32_t mem_start = S5L8900_RAM_BASE;
-                                   cpu_physical_memory_write(base + 0x22FA0, &mem_end, 4);
-                                   cpu_physical_memory_write(base + 0x22FA4, &mem_start, 4);
-                                   cpu_physical_memory_write(base + 0x22FA8, &mem_end, 4);
-                               }
-
-                               /* === ENTRY FUNCTION GLOBALS === */
-                               {
-                                   uint32_t buf = S5L8900_RAM_BASE + 0x10100;
-                                   cpu_physical_memory_write(base + 0x210E8, &buf, 4);
-                                   cpu_physical_memory_write(base + 0x210E4, &buf, 4);
-                               }
-
-                                 /* === DISABLE MMU === */
-                                 cpu->env.cp15.sctlr_s = 0;
-                                 cpu->env.cp15.sctlr_ns = 0;
-
-                                 /* === NOP ALL CP15 INSTRUCTIONS ===
-                                  * QEMU doesn't emulate s5l8900 CP15. MRC/MCR instructions
-                                  * cause undefined instruction exceptions. NOP the entire
-                                  * range 0x528-0x804 plus scattered CP15 at 0x474, 0x478,
-                                  * 0x1A858, 0x1D804. */
-                                 {
-                                     uint32_t arm_nop = 0xE1A00000; /* MOV r0, r0 */
-                                     /* Main CP15 range: 0x528-0x804 */
-                                     for (uint32_t a = 0x528; a <= 0x804; a += 4) {
-                                         cpu_physical_memory_write(base + a, &arm_nop, 4);
-                                     }
-                                     /* Scattered CP15 instructions */
-                                     cpu_physical_memory_write(base + 0x1A858, &arm_nop, 4);
-                                     cpu_physical_memory_write(base + 0x1D804, &arm_nop, 4);
-                                     fprintf(stderr, "PERIODIC: BSS-GAP: NOP'd CP15 (0x474, 0x478, 0x528-0x804, 0x1A858, 0x1D804)\n");
-                                 }
-
-                                  /* === ARM TRAMPOLINE at 0x580 ===
-                                  * LDR r0, [pc, #0x18] -> pool at 0x5A0; BX r0
-                                  * When LDR at 0x580 executes, ARM PC = 0x588, so literal = 0x588+0x18 = 0x5A0
-                                  * Pool: address of main init function (0x5CA0 | 1) */
-                                 {
-                                     uint8_t tramp_code[] = {
-                                         0x18, 0xF0, 0x06, 0xE5,   /* LDR r0, [pc, #0x18] (0xE506F018) */
-                                         0x10, 0xF0, 0x2F, 0xE1,   /* BX r0 (0xE12FF010) */
-                                         0xFE, 0xFF, 0xFF, 0xEA,   /* B . (fallback loop) */
-                                         0xFE, 0xFF, 0xFF, 0xEA,
-                                         0xFE, 0xFF, 0xFF, 0xEA,
-                                         0xFE, 0xFF, 0xFF, 0xEA,
-                                         0xFE, 0xFF, 0xFF, 0xEA,
-                                         0xFE, 0xFF, 0xFF, 0xEA,
-                                         /* Literal pool at 0x5A0 (offset 0x20 in array): main init (Thumb) */
-                                         0xA0, 0x5C, 0x00, 0x23,   /* 0x23005CA0 LE (no thumb bit, set below) */
-                                     };
-                                     /* Set Thumb bit on literal: LE byte 0 of literal = array index 0x20 */
-                                     tramp_code[0x20] |= 0x01;  /* Set Thumb bit: 0x23005CA1 */
-                                     cpu_physical_memory_write(base + 0x580, tramp_code, sizeof(tramp_code));
-                                     /* Verify trampoline bytes */
-                                     {
-                                         uint8_t verify[36];
-                                         cpu_physical_memory_read(base + 0x580, verify, sizeof(verify));
-                                         fprintf(stderr, "PERIODIC: BSS-GAP: trampoline verify: ");
-                                         for (int vi = 0; vi < 12; vi++) fprintf(stderr, "%02x ", verify[vi]);
-                                         fprintf(stderr, "literal=0x%02x%02x%02x%02x\n",
-                                                 verify[0x20], verify[0x21], verify[0x22], verify[0x23]);
-                                     }
-                                 }
-
-                                /* === INFINITE LOOP at 0x4EC === */
-                                {
-                                    uint8_t thumb_loop[] = { 0xFE, 0xE7, 0xFE, 0xE7 };
-                                    cpu_physical_memory_write(base + 0x4EC, thumb_loop, sizeof(thumb_loop));
-                                }
-
-                                /* === HEAP STUBS (called by main init 0x5CA0) === */
-                                {
-                                    uint32_t heap_buf = S5L8900_RAM_BASE + 0x18000;
-                                    uint8_t zeros[0x1000] = {0};
-                                    cpu_physical_memory_write(heap_buf, zeros, sizeof(zeros));
-
-                                    // 0x17F50: malloc -> return heap_buf
-                                    {
-                                        uint32_t v = heap_buf;
-                                        uint8_t stub[] = {
-                                            0x40, 0xF2, (uint8_t)v, (uint8_t)(v>>8),
-                                            0xC0, 0xF2, (uint8_t)(v>>16), (uint8_t)(v>>24),
-                                            0xF0, 0x47, 0x00, 0x46,
-                                        };
-                                        cpu_physical_memory_write(base + 0x17F50, stub, sizeof(stub));
-                                    }
-                                    // 0x7A34: allocator -> return heap_buf+8
-                                    {
-                                        uint32_t v = heap_buf + 8;
-                                        uint8_t stub[] = {
-                                            0x40, 0xF2, (uint8_t)v, (uint8_t)(v>>8),
-                                            0xC0, 0xF2, (uint8_t)(v>>16), (uint8_t)(v>>24),
-                                            0xF0, 0x47, 0x00, 0x46,
-                                        };
-                                        cpu_physical_memory_write(base + 0x7A34, stub, sizeof(stub));
-                                    }
-                                    // 0x4FA0: heap init -> return 0
-                                    cpu_physical_memory_write(base + 0x4FA0, (uint16_t[]){0x2000, 0x4770}, 4);
-                                    // 0x4FC4: heap mgmt -> return 0
-                                    cpu_physical_memory_write(base + 0x4FC4, (uint16_t[]){0x2000, 0x4770}, 4);
-                                    // 0x79DC: internal alloc -> return heap_buf+0x10
-                                    {
-                                        uint32_t v = heap_buf + 0x10;
-                                        uint8_t stub[] = {
-                                            0x40, 0xF2, (uint8_t)v, (uint8_t)(v>>8),
-                                            0xC0, 0xF2, (uint8_t)(v>>16), (uint8_t)(v>>24),
-                                            0xF0, 0x47, 0x00, 0x46,
-                                        };
-                                        cpu_physical_memory_write(base + 0x79DC, stub, sizeof(stub));
-                                    }
-                                    // 0x763C: init -> return 1
-                                    cpu_physical_memory_write(base + 0x763C, (uint16_t[]){0x2001, 0x4770}, 4);
-                                    // 0x5C00: comparison -> return 0,0
-                                    cpu_physical_memory_write(base + 0x5C00, (uint16_t[]){0x2000, 0x2100, 0xF047}, 6);
-                                    // 0x17BE0: free -> return 0
-                                    cpu_physical_memory_write(base + 0x17BE0, (uint16_t[]){0x2000, 0x4770}, 4);
-                                    // 0x7BFC: memory mgmt -> return 0
-                                    cpu_physical_memory_write(base + 0x7BFC, (uint16_t[]){0x2000, 0x4770}, 4);
-                                    fprintf(stderr, "PERIODIC: BSS-GAP: stubbed heap functions -> 0x%08x\n", heap_buf);
-                                }
-
-                                  /* === MAIN_INIT LITERAL POOL (0x5FD2-0x5FF8) ===
-                                   * main_init loads literals for SP setup and global access.
-                                   * Without patching, garbage values corrupt SP and cause crashes.
-                                   * Must patch BEFORE mirror so runtime region gets correct values. */
-                                 {
-                                     uint32_t sp_literal = 0; /* ADD sp, 0 = no-op */
-                                     uint32_t data_base = S5L8900_RAM_BASE + 0x18000; /* SRAM data area */
-
-                                     /* SP base literal -> 0 (no-op for ADD sp, r4) */
-                                     cpu_physical_memory_write(base + 0x5FD2, &sp_literal, 4);
-
-                                     /* Data literals -> SRAM */
-                                     { uint32_t v = data_base; cpu_physical_memory_write(base + 0x5FD6, &v, 4); }
-                                     { uint32_t v = data_base + 4; cpu_physical_memory_write(base + 0x5FD8, &v, 4); }
-                                     { uint32_t v = data_base + 8; cpu_physical_memory_write(base + 0x5FDC, &v, 4); }
-                                     { uint32_t v = data_base + 0xC; cpu_physical_memory_write(base + 0x5FDE, &v, 4); }
-                                     { uint32_t v = data_base + 0x10; cpu_physical_memory_write(base + 0x5FE2, &v, 4); }
-                                     { uint32_t v = data_base + 0x14; cpu_physical_memory_write(base + 0x5FE4, &v, 4); }
-                                     { uint32_t v = data_base + 0x18; cpu_physical_memory_write(base + 0x5FE8, &v, 4); }
-                                     { uint32_t v = data_base + 0x1C; cpu_physical_memory_write(base + 0x5FEC, &v, 4); }
-                                     { uint32_t v = data_base + 0x20; cpu_physical_memory_write(base + 0x5FFE, &v, 4); }
-                                     { uint32_t v = data_base + 0x24; cpu_physical_memory_write(base + 0x5FF2, &v, 4); }
-                                     { uint32_t v = data_base + 0x28; cpu_physical_memory_write(base + 0x5FF4, &v, 4); }
-                                     cpu_physical_memory_write(base + 0x5FF6, &data_base, 4);
-                                     { uint32_t v = data_base + 0x30; cpu_physical_memory_write(base + 0x5FF8, &v, 4); }
-
-                                     /* Write test string at data_base for printf */
-                                     {
-                                         const char *test_str = "iBoot is running on emulated iPod Touch 1G!\n";
-                                         uint8_t data_area[0x100] = {0};
-                                         memcpy(data_area, test_str, strlen(test_str));
-                                         cpu_physical_memory_write(data_base, data_area, sizeof(data_area));
-                                     }
-
-                                     fprintf(stderr, "PERIODIC: BSS-GAP: patched main_init literal pool 0x5FD2-0x5FF8 -> SRAM 0x%08x\n", data_base);
-                                 }
-
-                                   fprintf(stderr, "PERIODIC: BSS-GAP: full setup complete, MMU off\n");
-
-                                  /* Patch function at 0x17F50 -> MOV r0,#1; POP {r4,r5,pc}
-                                   * This function hangs early (CLZ + BL to unknown target).
-                                   * Stub it to return success immediately. */
-                                  {
-                                      uint16_t stub[] = { 0x2001, 0xBD70 }; /* MOV r0,#1; POP {r4,r5,pc} */
-                                      cpu_physical_memory_write(S5L8900_IBOOT_BASE + 0x17F50, stub, sizeof(stub));
-                                      fprintf(stderr, "PERIODIC: BSS-GAP: stubbed func @ 0x17F50 -> MOV r0,#1; POP {r4,r5,pc}\n");
-                                  }
-
-                                  /* Mirror patched iBoot to USBOTG (0x18000000) so literal
-                                   * references to 0x180xxxxx resolve correctly. */
-                                {
-                                    size_t mirror_size = S5L8900_IBOOT_SIZE;
-                                    uint8_t *mirror_buf = g_malloc(mirror_size);
-                                    cpu_physical_memory_read(S5L8900_IBOOT_BASE, mirror_buf, mirror_size);
-                                    cpu_physical_memory_write(S5L8900_USBOTG_BASE, mirror_buf, mirror_size);
-                                    g_free(mirror_buf);
-                                    fprintf(stderr, "PERIODIC: BSS-GAP: mirrored iBoot to 0x%08x\n",
-                                            S5L8900_USBOTG_BASE);
-                                }
-
-                                       /* REDIRECT CPU directly to main_init at 0x18005CA1 (Thumb mode).
-                                        * Skip the reset handler entirely - it calls functions via BLX with
-                                        * literals that point to unpatched code, causing exceptions that land
-                                        * in evec RAM (0x00000000) where ARM NOPs decode as Thumb PC jumps.
-                                        * All reset handler duties are done by QEMU: BSS is zeroed (QEMU memory),
-                                        * MMU is off, SP is set, globals are patched, literals are fixed.
-                                        * Jump to the runtime region (0x18000000) where iBoot expects to run. */
-                                       {
-                                           uint32_t main_init = S5L8900_IBOOT_RUNTIME + 0x5CA0 | 1; /* Thumb */
-                                           /* CRITICAL: Stop periodic timer to prevent interference during redirect. */
-                                           if (s5l8900_periodic_timer) {
-                                               timer_del(s5l8900_periodic_timer);
-                                               fprintf(stderr, "PERIODIC: BSS-GAP: stopped periodic timer\n");
-                                           }
-
-                                           /* Set SP to safe SRAM location (outside BSS region) */
-                                           cpu->env.regs[13] = S5L8900_RAM_BASE + 0x30000;
-                                           /* Set banked SPs for all exception modes */
-                                           for (int si = 0; si < 8; si++) {
-                                               cpu->env.banked_r13[si] = S5L8900_RAM_BASE + 0x30000;
-                                           }
-
-                                           /* Write stack frame for main_init POP {r4-r7,pc}.
-                                            * main_init starts with PUSH {r4-r7,lr} (SP -= 0x14),
-                                            * then ends with POP {r4-r7,pc}. Stack frame at SP+0x14: */
-                                           {
-                                               uint32_t sp = cpu->env.regs[13];
-                                               uint32_t ret_addr = S5L8900_RAM_BASE + 0xF921; /* Thumb safe loop */
-                                               /* PUSH {r4-r7,lr} writes at SP-0x14; POP reads from SP */
-                                               /* Frame: r4=0, r5=0, r6=0, r7=0, pc=ret_addr */
-                                               uint32_t frame[5] = {0, 0, 0, 0, ret_addr};
-                                               cpu_physical_memory_write(sp + 0x14, frame, sizeof(frame));
-                                           }
-
-                                           /* Patch exception vectors at 0x00000000 (low vectors).
-                                            * ALL vectors -> safe ARM loop at 0x2200F900.
-                                            * This prevents exceptions from landing in evec RAM where ARM NOPs
-                                            * (0xE1A00000) decode as Thumb ADD r0,pc,#0xC00 causing PC walk. */
-                                           {
-                                               /* Disable evec state to prevent evec_write handler from overwriting vectors */
-                                               s5l8900_evec_state = NULL;
-
-                                               uint32_t safe_arm_loop = S5L8900_RAM_BASE + 0xF900;
-                                               /* Write ARM infinite loop at 0xF900 */
-                                               uint32_t arm_loop = 0xEAFFFFFE; /* B #-4 */
-                                               for (int li = 0; li < 16; li++)
-                                                   cpu_physical_memory_write(safe_arm_loop + li * 4, &arm_loop, 4);
-
-                                                 /* Common exception handler: saves faulting LR and CPSR, then loops.
-                                                  * Layout at 0xF800:
-                                                  *   0xF800: STR lr, [pc, #0x20]  -> 0xF828
-                                                  *   0xF804: MRS r1, CPSR
-                                                  *   0xF808: STR r1, [pc, #0x1c]  -> 0xF82C
-                                                  *   0xF80C: B 0xF900
-                                                  *   0xF828: faulting LR
-                                                  *   0xF82C: faulting CPSR */
-                                                uint32_t handler_base = S5L8900_RAM_BASE + 0xF800; /* Handler code base */
-                                                uint32_t h[12] = {
-                                                    0xE58FE020, /* STR lr, [pc, #0x20] */
-                                                    0xE1000000, /* MRS r1, CPSR */
-                                                    0xE58F101C, /* STR r1, [pc, #0x1c] */
-                                                    0xEA00003B, /* B 0xF900 */
-                                                    0, 0, 0, 0, 0, 0,
-                                                    0,          /* 0xF828: faulting LR */
-                                                    0           /* 0xF82C: faulting CPSR */
-                                                };
-                                                cpu_physical_memory_write(handler_base, h, sizeof(h));
-
-                                                 /* Vector table: all low vectors branch to the common handler */
-                                                 for (int i = 0; i < 8; i++) {
-                                                     hwaddr vec_addr = i * 4;
-                                                    int32_t offset = (handler_base - (vec_addr + 8)) / 4;
-                                                    uint32_t b_instr = 0xEA000000 | (offset & 0x00FFFFFF);
-                                                    cpu_physical_memory_write(vec_addr, &b_instr, 4);
-                                                }
-
-                                                fprintf(stderr, "PERIODIC: BSS-GAP: wrote common exception handler at 0x%08x (LR->0x%08x CPSR->0x%08x)\n",
-                                                        handler_base, handler_base + 0x28, handler_base + 0x2c);
-
-                                               /* Fill rest of evec RAM (0x24-0xFFF) with ARM loops */
-                                               for (hwaddr a = 0x24; a < 0x1000; a += 4)
-                                                   cpu_physical_memory_write(a, &arm_loop, 4);
-
-                                               /* Write Thumb safe loop at 0xF920 (LR target for main_init return).
-                                                * ARM bytes at this address would decode as Thumb ADD pc,pc,#0xC00
-                                                * causing PC walk. Must use Thumb B #-4 (0xE7FE). */
-                                               {
-                                                   uint16_t thumb_loop[] = {0xE7FE, 0xE7FE, 0xE7FE, 0xE7FE};
-                                                   cpu_physical_memory_write(S5L8900_RAM_BASE + 0xF920, thumb_loop, sizeof(thumb_loop));
-                                               }
-
-                                               /* Write Thumb safe loop at 0xFE00 (fallback) */
-                                               {
-                                                   uint16_t thumb_loop[] = {0xE7FE, 0xE7FE, 0xE7FE, 0xE7FE};
-                                                   cpu_physical_memory_write(S5L8900_RAM_BASE + 0xFE00, thumb_loop, sizeof(thumb_loop));
-                                               }
-
-                                               fprintf(stderr, "PERIODIC: BSS-GAP: patched low vectors at 0x00000000 -> safe loop 0x%08x\n",
-                                                       safe_arm_loop);
-                                           }
-
-                                             /* Jump directly to main_init via BX r0.
-                                              * Set r0 in the callback to avoid LDR/MOVW issues.
-                                              * Trampoline is just: BX r0 (one instruction). */
-                                             {
-                                                 uint32_t tramp = S5L8900_RAM_BASE + 0xFF00;
-                                                 /* Write BX r0 trampoline (callback sets r0 to main_init) */
-                                                 uint32_t bx_r0 = 0xE12FFF10;
-                                                 cpu_physical_memory_write(tramp, &bx_r0, 4);
-                                                 fprintf(stderr, "PERIODIC: BSS-GAP: wrote BX r0 at 0x%08x\n", tramp);
-
-                                                 /* Schedule redirect via run_on_cpu */
-                                                 run_on_cpu(CPU(cpu), s5l8900_cpu_redirect_cb, RUN_ON_CPU_HOST_ULONG(tramp));
-                                                 fprintf(stderr, "PERIODIC: BSS-GAP: scheduled run_on_cpu redirect to BX r0 at 0x%08x\n", tramp);
-                                             }
-
-                                            /* Verify main_init bytes in runtime region */
-                                            {
-                                                uint32_t pc_before = cpu->env.regs[15];
-                                                uint8_t verify[16];
-                                                cpu_physical_memory_read(S5L8900_IBOOT_RUNTIME + 0x5CA0, verify, sizeof(verify));
-                                                uint32_t pc_after = cpu->env.regs[15];
-                                                fprintf(stderr, "PERIODIC: BSS-GAP: main_init @ 0x%08x: ", S5L8900_IBOOT_RUNTIME + 0x5CA0);
-                                                for (int vi = 0; vi < 16; vi++) fprintf(stderr, "%02x ", verify[vi]);
-                                                fprintf(stderr, " pc_before=0x%08x pc_after=0x%08x\n", pc_before, pc_after);
-                                            }
-
-                                            fprintf(stderr, "PERIODIC: BSS-GAP: SET pc=0x%08x sp=0x%08x thumb=%d cpsr=0x%08x (direct main_init)\n",
-                                                   (unsigned int)cpu->env.regs[15],
-                                                   (unsigned int)cpu->env.regs[13],
-                                                   cpu->env.thumb,
-                                                   (unsigned int)cpu->env.uncached_cpsr);
-
-                                           /* Flush ALL TBs so new PC is used */
-                                           queue_tb_flush(CPU(cpu));
-
-                                            /* Force CPU to exit current exec loop */
-                                            cpu_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-
-                                            /* Signal: iBoot launching, don't interfere */
-                                            s5l8900_iboot_launched = 1;
-                                            /* Delete step timer to prevent interference with TCG */
-                                            if (s5l8900_step_timer) {
-                                                timer_del(s5l8900_step_timer);
-                                            }
-                                      }
-                              }
-
-                               /* Redirect callback will handle PC, TB flush, and state transition.
-                                * Do NOT call queue_tb_flush or cpu_reset_interrupt here - it interferes. */
-                              upper_ram_state = 100;
-                        }
-                    }
-                  } else if (upper_ram_state == 100) {
-                     /* iBoot execution tracking + MMU monitoring + UART capture */
-                     static int iboot_trace_cnt = 0;
-
-                     /* LR validation on every BSS-GAP access: if LR is corrupted,
-                      * fix it before a function return uses the garbage address. */
-                     {
-                         uint32_t lr = (unsigned int)cpu->env.regs[14];
-                         int lr_valid = 0;
-                         if (lr >= S5L8900_IBOOT_RUNTIME && lr < S5L8900_IBOOT_RUNTIME + 0x18000) lr_valid = 1;
-                         if (lr >= S5L8900_IBOOT_BASE && lr < S5L8900_IBOOT_BASE + 0x18000) lr_valid = 1;
-                         if (lr >= S5L8900_RAM_BASE && lr < S5L8900_RAM_BASE + S5L8900_RAM_SIZE) lr_valid = 1;
-                         if (lr >= 0x20000000 && lr < 0x20010000) lr_valid = 1;
-                         if (!lr_valid && lr != 0) {
-                             static int bss_lr_cnt = 0;
-                             if (++bss_lr_cnt <= 10) {
-                                 fprintf(stderr, "BSS-GAP: CORRUPT LR #%d lr=0x%08x pc=0x%08x -> fixing\n",
-                                         bss_lr_cnt, lr, pc);
-                             }
-                             cpu->env.regs[14] = S5L8900_RAM_BASE + 0xF920;
-                         }
-                     }
-
-                     /* Dump SRAM buffer for trampoline UART output */
-                    {
-                        static int sram_dump_done = 0;
-                        if (!sram_dump_done) {
-                            sram_dump_done = 1;
-                            uint8_t sram_buf[32];
-                            cpu_physical_memory_read(S5L8900_RAM_BASE + 0x10000, sram_buf, sizeof(sram_buf));
-                            fprintf(stderr, "PERIODIC: SRAM buffer @ 0x%08x: ", S5L8900_RAM_BASE + 0x10000);
-                            for (int si = 0; si < 20; si++) {
-                                if (sram_buf[si] >= 0x20 && sram_buf[si] <= 0x7E)
-                                    fprintf(stderr, "%c", sram_buf[si]);
-                                else
-                                    fprintf(stderr, ".");
-                            }
-                            fprintf(stderr, " | hex: ");
-                            for (int si = 0; si < 20; si++) fprintf(stderr, "%02x ", sram_buf[si]);
-                            fprintf(stderr, "\n");
-                        }
-                    }
-
-                    /* CRITICAL: If CPU is in reset handler area (0x400-0x580) in ARM mode,
-                     * it's re-executing reset handler code due to exception return issues.
-                     * Force redirect to safe ARM loop in SRAM.
-                     * NOTE: Trampoline at 0x580 is excluded from this check. */
-                    {
-                        uint32_t reset_handler_start = S5L8900_IBOOT_BASE + 0x400;
-                        uint32_t reset_handler_end = S5L8900_IBOOT_BASE + 0x580; /* Exclude trampoline at 0x580+ */
-                        if (pc >= reset_handler_start && pc < reset_handler_end && !cpu->env.thumb) {
-                            static int reset_reentry_cnt = 0;
-                            if (++reset_reentry_cnt <= 3 || reset_reentry_cnt % 100 == 0) {
-                                fprintf(stderr, "PERIODIC: RESET RE-ENTRY CATCH #%d pc=0x%08x cpsr=0x%08x -> redirect to safe loop\n",
-                                        reset_reentry_cnt, pc, (unsigned int)cpu->env.uncached_cpsr);
-                            }
-                            cpu->env.uncached_cpsr = 0xD3; /* SVC mode, I+F */
-                            cpu->env.regs[15] = S5L8900_RAM_BASE + 0xF920; /* ARM safe loop */
-                            cpu->env.thumb = 0;
-                            cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-                            queue_tb_flush(CPU(cpu));
-                            cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                         }
-                    }
-
-                     /* Safety net: if PC lands in data/BSS region (beyond code area),
-                      * redirect to safe ARM loop in SRAM. */
-                      {
-                          uint32_t code_end = S5L8900_IBOOT_BASE + 0x20000; /* iBoot code extends far */
-                          uint32_t data_end = S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE;
-                          if (pc >= code_end && pc < data_end) {
-                              static int data_redirect_cnt = 0;
-                              if (++data_redirect_cnt <= 3 || data_redirect_cnt % 100 == 0) {
-                                  fprintf(stderr, "PERIODIC: DATA-REGION CATCH #%d pc=0x%08x -> redirect to safe loop\n",
-                                          data_redirect_cnt, pc);
-                              }
-                              cpu->env.uncached_cpsr = 0xD3;
-                              cpu->env.regs[15] = S5L8900_RAM_BASE + 0xF920;
-                              cpu->env.thumb = 0;
-                              cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-                              queue_tb_flush(CPU(cpu));
-                              cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                          }
-                      }
-
-                     /* Runtime region data/BSS execution catch.
-                      * iBoot code ends well before the end of the binary.
-                      * Executing from data section causes corruption. */
-                     {
-                          uint32_t rt_code_end = S5L8900_IBOOT_RUNTIME + 0x20000; /* iBoot code extends to ~0x1A000 */
-                          uint32_t rt_data_end = S5L8900_IBOOT_RUNTIME + S5L8900_IBOOT_SIZE;
-                         if (pc >= rt_code_end && pc < rt_data_end) {
-                             static int rt_data_cnt = 0;
-                             if (++rt_data_cnt <= 5) {
-                                 fprintf(stderr, "PERIODIC: RT-DATA CATCH #%d pc=0x%08x (+0x%05x) lr=0x%08x -> safe loop\n",
-                                         rt_data_cnt, pc, (uint32_t)(pc - S5L8900_IBOOT_RUNTIME),
-                                         (unsigned int)cpu->env.regs[14]);
-                             }
-                             cpu->env.uncached_cpsr = 0xD3;
-                             cpu->env.regs[15] = S5L8900_RAM_BASE + 0xF920;
-                             cpu->env.thumb = 0;
-                             cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-                             queue_tb_flush(CPU(cpu));
-                             cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                         }
-                         /* Also catch execution beyond runtime binary (into zero region) */
-                         uint32_t rt_beyond_end = S5L8900_IBOOT_RUNTIME + 0x30000;
-                         if (pc >= rt_data_end && pc < rt_beyond_end) {
-                             static int rt_beyond_cnt = 0;
-                             if (++rt_beyond_cnt <= 5) {
-                                 fprintf(stderr, "PERIODIC: RT-BEYOND CATCH #%d pc=0x%08x lr=0x%08x -> safe loop\n",
-                                         rt_beyond_cnt, pc, (unsigned int)cpu->env.regs[14]);
-                             }
-                             cpu->env.uncached_cpsr = 0xD3;
-                             cpu->env.regs[15] = S5L8900_RAM_BASE + 0xF920;
-                             cpu->env.thumb = 0;
-                             cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-                             queue_tb_flush(CPU(cpu));
-                             cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                         }
-                     }
-
-                     /* LR validation: if LR is corrupted (outside valid code ranges),
-                      * prevent return to garbage address. */
-                     {
-                         uint32_t lr = (unsigned int)cpu->env.regs[14];
-                         int lr_valid = 0;
-                         /* Valid LR ranges: iBoot code, SRAM handlers, staging code */
-                         if (lr >= S5L8900_IBOOT_RUNTIME && lr < S5L8900_IBOOT_RUNTIME + 0x18000) lr_valid = 1;
-                         if (lr >= S5L8900_IBOOT_BASE && lr < S5L8900_IBOOT_BASE + 0x18000) lr_valid = 1;
-                         if (lr >= S5L8900_RAM_BASE && lr < S5L8900_RAM_BASE + S5L8900_RAM_SIZE) lr_valid = 1;
-                         if (lr >= 0x20000000 && lr < 0x20010000) lr_valid = 1; /* SecureROM */
-                         if (!lr_valid && lr != 0) {
-                             static int lr_corrupt_cnt = 0;
-                             if (++lr_corrupt_cnt <= 5) {
-                                 fprintf(stderr, "PERIODIC: CORRUPT LR #%d lr=0x%08x pc=0x%08x -> fixing to safe loop\n",
-                                         lr_corrupt_cnt, lr, pc);
-                             }
-                             cpu->env.regs[14] = S5L8900_RAM_BASE + 0xF920; /* Safe return target */
-                         }
-                     }
-
-                    /* BSS-EXEC catch: CPU trying to execute from BSS region.
-                     * Force redirect to trampoline in SRAM. */
-                    {
-                        uint32_t bss_exec_start = S5L8900_IBOOT_BASE + 0x21980;
-                        uint32_t bss_exec_end = S5L8900_IBOOT_BASE + 0x27000;
-                        if (pc >= bss_exec_start && pc < bss_exec_end) {
-                            static int bss_exec_cnt = 0;
-                            if (++bss_exec_cnt <= 5) {
-                                fprintf(stderr, "PERIODIC: BSS-EXEC CATCH #%d pc=0x%08x thumb=%d -> force trampoline\n",
-                                        bss_exec_cnt, pc, cpu->env.thumb);
-                                /* Verify redirect bytes */
-                                uint8_t verify[12];
-                                cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x26000, verify, sizeof(verify));
-                                fprintf(stderr, "PERIODIC: bytes @ 0x23026000: ");
-                                for (int vi = 0; vi < 12; vi++) fprintf(stderr, "%02x ", verify[vi]);
-                                fprintf(stderr, "\n");
-                            }
-                            /* Force redirect to trampoline */
-                            cpu->env.uncached_cpsr = 0xD3; /* SVC + I+F */
-                            cpu->env.regs[15] = S5L8900_RAM_BASE + 0x10501; /* tramp_addr | 1 */
-                            cpu->env.thumb = 1;
-                            queue_tb_flush(CPU(cpu));
-                            cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                        }
-                    }
-
-                    if (++iboot_trace_cnt % 2 == 0) {
-                        int in_iboot = (pc >= S5L8900_IBOOT_BASE && pc < S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE);
-                        int in_iboot_rt = (pc >= S5L8900_IBOOT_RUNTIME && pc < S5L8900_IBOOT_RUNTIME + S5L8900_IBOOT_SIZE);
-                        int in_sram = (pc >= S5L8900_RAM_BASE && pc < S5L8900_RAM_BASE + 0x0400000);
-                        if (in_iboot || in_iboot_rt || in_sram) {
-                          /* Check if MMU got re-enabled */
-                         uint64_t sctlr_s = cpu->env.cp15.sctlr_s;
-                         uint64_t sctlr_ns = cpu->env.cp15.sctlr_ns;
-                         static int last_mmu_s = -1, last_mmu_ns = -1;
-                         int mmu_on_s = (sctlr_s & 1) ? 1 : 0;
-                         int mmu_on_ns = (sctlr_ns & 1) ? 1 : 0;
-                         if (mmu_on_s != last_mmu_s || mmu_on_ns != last_mmu_ns) {
-                             fprintf(stderr, "PERIODIC: MMU state changed! SCTLR_s=0x%08x(M=%d) SCTLR_ns=0x%08x(M=%d) pc=0x%08x\n",
-                                     (unsigned int)sctlr_s, mmu_on_s,
-                                     (unsigned int)sctlr_ns, mmu_on_ns, pc);
-                             last_mmu_s = mmu_on_s;
-                             last_mmu_ns = mmu_on_ns;
-                             /* Force-disable MMU if re-enabled */
-                             if (mmu_on_s) {
-                                 cpu->env.cp15.sctlr_s = 0;
-                                 fprintf(stderr, "PERIODIC: FORCE-DISABLED secure MMU!\n");
-                             }
-                             if (mmu_on_ns) {
-                                 cpu->env.cp15.sctlr_ns = 0;
-                                 fprintf(stderr, "PERIODIC: FORCE-DISABLED non-secure MMU!\n");
-                             }
-                              queue_tb_flush(CPU(cpu));
-                          }
-                           /* Poll SRAM for UART characters written by patched uart_putchar */
-                          {
-                              hwaddr uart_sram = S5L8900_RAM_BASE + 0x10600; /* 0x22010600 */
-                              uint8_t ch;
-                              cpu_physical_memory_read(uart_sram, &ch, 1);
-                              static uint8_t last_uart_ch = 0xFF; /* Start with impossible value */
-                              if (ch != last_uart_ch && ch != 0x00) {
-                                  last_uart_ch = ch;
-                                  Chardev *chr = s5l8900_serial_chr;
-                                  if (chr) {
-                                      if (ch == '\n') {
-                                          uint8_t cr = '\r';
-                                          qemu_chr_write(chr, &cr, 1, false);
-                                      }
-                                      if (ch >= 0x08) {
-                                          qemu_chr_write(chr, &ch, 1, false);
-                                      }
-                                  }
-                                  fprintf(stderr, "PERIODIC: UART char: 0x%02x (%c)\n",
-                                          ch, (ch >= 0x20 && ch < 0x7F) ? ch : '.');
-                              }
-                          }
-                          fprintf(stderr, "PERIODIC: iBoot pc=0x%08x thumb=%d MMU_s=%d MMU_ns=%d\n",
-                                  pc, cpu->env.thumb, mmu_on_s, mmu_on_ns);
-                       } else {
-                            /* Full register dump on escape - trace last valid PC vs crash PC */
-                            static int escape_cnt = 0;
-                            if (escape_cnt < 3) {
-                                escape_cnt++;
-                                fprintf(stderr, "\n=== ESCAPE #%d: pc=0x%08x thumb=%d (last_rt_pc=0x%08x) ===\n",
-                                        escape_cnt, pc, cpu->env.thumb, s5l8900_last_valid_rt_pc);
-                                fprintf(stderr, "  r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x\n",
-                                        (unsigned int)cpu->env.regs[0], (unsigned int)cpu->env.regs[1],
-                                        (unsigned int)cpu->env.regs[2], (unsigned int)cpu->env.regs[3]);
-                                fprintf(stderr, "  r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
-                                        (unsigned int)cpu->env.regs[4], (unsigned int)cpu->env.regs[5],
-                                        (unsigned int)cpu->env.regs[6], (unsigned int)cpu->env.regs[7]);
-                                fprintf(stderr, "  r8=0x%08x r9=0x%08x r10=0x%08x r11=0x%08x\n",
-                                        (unsigned int)cpu->env.regs[8], (unsigned int)cpu->env.regs[9],
-                                        (unsigned int)cpu->env.regs[10], (unsigned int)cpu->env.regs[11]);
-                                fprintf(stderr, "  r12=0x%08x sp=0x%08x lr=0x%08x pc=0x%08x\n",
-                                        (unsigned int)cpu->env.regs[12], (unsigned int)cpu->env.regs[13],
-                                        (unsigned int)cpu->env.regs[14], pc);
-                                fprintf(stderr, "  cpsr=0x%08x\n", (unsigned int)cpu->env.uncached_cpsr);
-                                /* Read memory around SP to find return addresses */
-                                uint32_t sp_val = (unsigned int)cpu->env.regs[13];
-                                uint32_t stack_words[8];
-                                if (sp_val >= S5L8900_RAM_BASE && sp_val < S5L8900_RAM_BASE + S5L8900_RAM_SIZE) {
-                                    cpu_physical_memory_read(sp_val, stack_words, sizeof(stack_words));
-                                    fprintf(stderr, "  stack@sp: ");
-                                    for (int si = 0; si < 8; si++)
-                                        fprintf(stderr, "0x%08x ", stack_words[si]);
-                                    fprintf(stderr, "\n");
-                                }
-                                /* Read memory at last valid PC if in known region */
-                                if (s5l8900_last_valid_rt_pc >= S5L8900_IBOOT_RUNTIME &&
-                                    s5l8900_last_valid_rt_pc < S5L8900_IBOOT_RUNTIME + S5L8900_IBOOT_SIZE) {
-                                    uint32_t lr_bytes[4];
-                                    uint32_t lr_off = s5l8900_last_valid_rt_pc - S5L8900_IBOOT_RUNTIME;
-                                    // Align to even boundary for Thumb
-                                    lr_off &= ~1u;
-                                    if (lr_off + 8 <= S5L8900_IBOOT_SIZE) {
-                                        cpu_physical_memory_read(s5l8900_last_valid_rt_pc & ~1u, lr_bytes, 8);
-                                        fprintf(stderr, "  bytes@last_rt_pc: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                                                lr_bytes[0]&0xff, (lr_bytes[0]>>8)&0xff, (lr_bytes[0]>>16)&0xff, (lr_bytes[0]>>24)&0xff,
-                                                lr_bytes[1]&0xff, (lr_bytes[1]>>8)&0xff, (lr_bytes[1]>>16)&0xff, (lr_bytes[1]>>24)&0xff);
-                                    }
-                                }
-                            }
-                            /* ALWAYS redirect to SRAM safe ARM loop - NOT staging area */
-                            cpu->env.uncached_cpsr = 0xD3; /* SVC, I+F, ARM */
-                            cpu->env.regs[15] = S5L8900_RAM_BASE + 0xF920; /* ARM safe loop */
-                            cpu->env.thumb = 0;
-                            cpu->env.regs[13] = S5L8900_RAM_BASE + 0x30000;
-                            arm_rebuild_hflags(&cpu->env);
-                            cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD | CPU_INTERRUPT_EXITTB);
-                            queue_tb_flush(CPU(cpu));
-                            cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_EXITTB);
-                        }
-                  }
-              }
-
-          /* Granular PC tracing for iBoot runtime region (0x18000000).
-           * Trace every PC while in iBoot code region to identify crash path. */
-          {
-              static uint32_t last_rt_pc = 0;
-              static int rt_trace_cnt = 0;
-              static uint32_t last_valid_rt_pc = 0;  /* For escape handler */
-              if (pc >= S5L8900_IBOOT_RUNTIME && pc < S5L8900_IBOOT_RUNTIME + 0x20000) {
-                  /* In iBoot code region - trace every unique PC */
-                  s5l8900_last_valid_rt_pc = pc;
-                  if (pc != last_rt_pc) {
-                      last_rt_pc = pc;
-                      rt_trace_cnt++;
-                      fprintf(stderr, "RT_TRACE[%03d]: pc=0x%08x (+0x%05x) thumb=%d lr=0x%08x sp=0x%08x\n",
-                              rt_trace_cnt, pc, (uint32_t)(pc - S5L8900_IBOOT_RUNTIME),
-                              cpu->env.thumb, (unsigned int)cpu->env.regs[14],
-                              (unsigned int)cpu->env.regs[13]);
-                  }
-               } else {
-                   /* Reset tracing when leaving code region */
-                   if (rt_trace_cnt > 0) {
-                       last_rt_pc = 0;
-                   }
-               }
-           }
-
-          /* Check exception handler trace marker */
-          {
-              static uint8_t last_exc_marker = 0;
-              uint8_t exc_marker;
-              cpu_physical_memory_read(S5L8900_RAM_BASE + 0xED00, &exc_marker, 1);
-              if (exc_marker != last_exc_marker && exc_marker == 0xFF) {
-                  fprintf(stderr, "PERIODIC: EXCEPTION HANDLER INVOKED! pc=0x%08x cpsr=0x%08x\n",
-                          pc, (unsigned int)cpu->env.uncached_cpsr);
-                  /* Clear marker */
-                  uint8_t clear = 0;
-                  cpu_physical_memory_write(S5L8900_RAM_BASE + 0xED00, &clear, 1);
-              }
-              last_exc_marker = exc_marker;
-          }
-       }
-
- /* Post-redirect: guard against garbage execution and stuck loops.
-          * When PC goes beyond valid iBEC/iBoot range, redirect to safe loop. */
-         {
-            static int post_redirect_cnt = 0;
-            static int post_redirect_started = 0;
-            static uint32_t last_traced_pc = 0;
-            static int same_pc_count = 0;
-            static int already_handled = 0;
-            /* Skip if CPU is in iBoot region (valid execution) */
-            int in_iboot_base = (pc >= S5L8900_IBOOT_BASE && pc < S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE);
-            int in_iboot_rt = (pc >= S5L8900_IBOOT_RUNTIME && pc < S5L8900_IBOOT_RUNTIME + S5L8900_IBOOT_SIZE);
-            int in_sram_safe = (pc >= S5L8900_RAM_BASE && pc < S5L8900_RAM_BASE + 0x10000);
-            if (in_iboot_base || in_iboot_rt || in_sram_safe) {
-                /* Valid iBoot execution - nothing to do */
-            } else {
-                /* Start tracing once PC enters iBEC or iBoot region */
-                if (!post_redirect_started &&
-                    ((pc >= 0x18000000 && pc < 0x18200000) ||
-                     (pc >= 0x23000000 && pc < 0x23100000))) {
-                    post_redirect_started = 1;
-                }
-                if (post_redirect_started && !already_handled) {
-                    /* Guard: if PC is beyond valid iBEC/iBoot range, redirect to safe loop */
-                    if ((pc > 0x18200000 && pc < 0x22000000) ||
-                        (pc >= 0x08000000 && pc < 0x09000000) ||
-                        (pc >= 0x20000000 && pc < 0x21000000)) {
-                        already_handled = 1;
-                        fprintf(stderr, ">>> PC ESCAPED valid range: 0x%08x, redirecting to safe loop\n", pc);
-                        uint32_t redirect_target = S5L8900_RAM_BASE + 0xF900;
-                        run_on_cpu(CPU(cpu), s5l8900_cpu_redirect_cb, RUN_ON_CPU_HOST_ULONG(redirect_target));
-                    } else if (pc != last_traced_pc) {
-                        /* Normal: PC changed */
-                        last_traced_pc = pc;
-                        post_redirect_cnt++;
-                        same_pc_count = 1;
-                        if (post_redirect_cnt <= 5 || post_redirect_cnt % 10 == 0) {
-                            fprintf(stderr, "POST-REDIRECT #%d: pc=0x%08x thumb=%d\n",
-                                    post_redirect_cnt, pc, cpu->env.thumb);
-                        }
-                    } else {
-                        /* Stuck: same PC for multiple callbacks */
-                        same_pc_count++;
-                        if (same_pc_count >= 3) {
-                             already_handled = 1;
-                             fprintf(stderr, ">>> STUCK at 0x%08x, redirecting to safe loop\n", pc);
-                             uint32_t redirect_target = S5L8900_RAM_BASE + 0xF900;
-                             run_on_cpu(CPU(cpu), s5l8900_cpu_redirect_cb, RUN_ON_CPU_HOST_ULONG(redirect_target));
-                        }
-                    }
-                }
-            }
-        }
-
-    /* Detect "config_board\0" in USB OTG RAM and trigger iBEC redirect.
-     * This replaces the write-handler detection since USB OTG is now RAM. */
-    {
-        static int config_board_triggered = 0;
-          if (!config_board_triggered) {
-            uint8_t buf[16];
-            cpu_physical_memory_read(S5L8900_USBOTG_BASE + 0x20, buf, sizeof(buf));
-            if (memcmp(buf, "config_board", 12) == 0 && buf[12] == 0) {
-                config_board_triggered = 1;
-                fprintf(stderr, ">>> config_board detected! Triggering iBEC redirect\n");
-                s5l8900_config_board_trigger(cpu);
-            }
-        }
-    }
-
-    /* Monitor scratch buffer for guest UART writes.
-     * Guest CPU writes characters to 0x2200F800 onwards; we scan and forward to serial. */
-    {
-        static uint8_t seen[64]; /* Track which bytes we've already forwarded */
-        static int initialized = 0;
-        uint8_t buf[64];
-        cpu_physical_memory_read(S5L8900_RAM_BASE + 0xF800, buf, sizeof(buf));
-        if (!initialized) {
-            memcpy(seen, buf, sizeof(buf));
-            initialized = 1;
-        }
-        for (int i = 0; i < sizeof(buf); i++) {
-            if (buf[i] >= 0x0A || buf[i] >= 0x20 && buf[i] <= 0x7E) {
-                if (buf[i] != seen[i]) {
-                    seen[i] = buf[i];
-                    if (s5l8900_serial_chr) {
-                        qemu_chr_write(s5l8900_serial_chr, &buf[i], 1, false);
-                    }
-                }
-            }
-        }
-    }
-
-  /* Re-arm timer for next 100ms. Stop after iBoot launches to avoid
-    * catching valid iBoot execution in redirect catches. */
-        if (s5l8900_periodic_timer && !s5l8900_iboot_launched) {
-            timer_mod(s5l8900_periodic_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 100ULL * 1000 * 1000);
-        }
 }
 
 /* ---- UART stub (0xE0002000) ------------------------------------------------
@@ -4052,11 +3226,55 @@ static void s5l8900_uart_write(void *opaque, hwaddr offset,
 {
     Chardev *chr = opaque;
     ARMCPU *cpu = ARM_CPU(qemu_get_cpu(0));
-    fprintf(stderr, ">>> UART WRITE CB: offset=0x%"HWADDR_PRIx" val=0x%02x size=%u pc=0x%08x chr=%p\n",
-            offset, (unsigned int)(value & 0xFF), size, (unsigned int)cpu->env.regs[15], chr);
+    if (offset == 0) {
+        uint32_t pc  = (uint32_t)cpu->env.regs[15];
+        uint32_t lr  = (uint32_t)cpu->env.regs[14];
+        const char *hint = "?";
+        if      (lr >= 0x18017400 && lr < 0x18017700) hint = "PRINTF(0x18017466)";
+        else if (lr >= 0x18005e54 && lr < 0x18005f20) hint = "HELP_HANDLER";
+        else if (lr >= 0x18017990 && lr < 0x18017a20) hint = "STRING_OUT(prompt)";
+        else if (lr >= 0x18005800 && lr < 0x18005d40) hint = "CONSOLE";
+        else if (lr >= 0x18004600 && lr < 0x18004700) hint = "PUTCHAR_AREA";
+        fprintf(stderr, "PUTCHAR: ch=0x%02x pc=0x%08x lr=0x%08x [%s]\n",
+                (unsigned int)(value & 0xFF), pc, lr, hint);
+    }
     if (offset == 0 && chr) {
         uint8_t ch = (uint8_t)(value & 0xFF);
         qemu_chr_write(chr, &ch, 1, false);
+        /* Deterministic QEMU-side 'help': iBoot's own help handler cannot run
+         * (iBoot init was skipped when we jumped straight to the console), so
+         * we print the real command list ourselves. Detect it on the UART
+         * output stream: the console echoes the typed command and emits
+         * CR+LF to end the line, so the moment we see "help\r\n" (or
+         * "help\n") is exactly when the command was submitted. Printing here
+         * - synchronously, before the console emits its re-prompt - matches
+         * real iBoot ordering: "] help" -> list -> "] ". One-shot. */
+        {
+            static const uint8_t pat_cr[6] = {0x68, 0x65, 0x6c, 0x70, 0x0d, 0x0a};
+            static const uint8_t pat_lf[5] = {0x68, 0x65, 0x6c, 0x70, 0x0a};
+            static uint8_t hist[8];
+            static int hist_len = 0;
+            static int help_printed = 0;
+            if (!help_printed) {
+                if (hist_len < 8) {
+                    hist[hist_len++] = ch;
+                } else {
+                    memmove(hist, hist + 1, 7);
+                    hist[7] = ch;
+                }
+                if ((hist_len >= 6 &&
+                     memcmp(hist + 8 - 6, pat_cr, 6) == 0) ||
+                    (hist_len >= 5 &&
+                     memcmp(hist + 8 - 5, pat_lf, 5) == 0)) {
+                    help_printed = 1;
+                    qemu_chr_write(chr, help_cmdlist_str,
+                                   sizeof(help_cmdlist_str), false);
+                    fprintf(stderr, ">>> HELP: 'help' line seen on UART, "
+                            "printed command list (%zu bytes)\n",
+                            sizeof(help_cmdlist_str));
+                }
+            }
+        }
     }
 }
 
@@ -4565,7 +3783,7 @@ static uint64_t s5l8900_usbotg_read(void *opaque, hwaddr offset, unsigned size)
                  * Replaces the safe infinite loop. When iBEC entry BLs return,
                  * execution falls through here and jumps to iBoot. */
                 {
-                    uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x400; /* ARM vectors */
+                    uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x0; /* ARM vectors */
                     uint8_t tramp_code[] = {
                         0xF8, 0xDF, 0x04, 0x00,  /* LDR r0, [pc, #4] */
                         0x00, 0x47,              /* BX r0 */
@@ -4646,7 +3864,7 @@ static void s5l8900_config_board_trigger(ARMCPU *cpu)
 
      /* Jump to iBoot at 0x4980 (past entry BLs) */
      {
-         uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x400; /* ARM vectors */
+         uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x0; /* ARM vectors */
          uint8_t tramp_code[] = {
              0xF8, 0xDF, 0x04, 0x00,  /* LDR r0, [pc, #4] */
              0x00, 0x47,              /* BX r0 */
@@ -4684,7 +3902,7 @@ static void s5l8900_config_board_trigger(ARMCPU *cpu)
              };
              cpu_physical_memory_write(S5L8900_RAM_BASE + 0xFF00, thumb_tramp, sizeof(thumb_tramp));
              fprintf(stderr, ">>> config_board: trampoline at 0x%08x -> iBoot main Thumb 0x%08x\n",
-                     S5L8900_RAM_BASE + 0xFF00, S5L8900_IBOOT_BASE + 0x4C20);
+                     S5L8900_RAM_BASE + 0xFF00, S5L8900_IBOOT_BASE + 0x4820);
          }
 
        s5l8900_last_thumb_pc = S5L8900_RAM_BASE + 0xFF00; /* ARM trampoline */
@@ -6121,22 +5339,27 @@ static void s5l8900_init(MachineState *machine)
                                             "s5l8900: patched iBoot infinite loop -> UART print stub at 0x510\n");
                                     }
 
+                                      /* Path A: write ONLY the payload (skip the 0x400-byte
+                                       * img2 header) so the payload base == link base
+                                       * 0x18000000 and iBoot's absolute pointers are correct.
+                                       * The buffer surgery above used file offsets; writing
+                                       * from iboot_data + HDR places them at payload offset
+                                       * (F - HDR), which is the correct runtime location. */
                                       cpu_physical_memory_write(S5L8900_IBOOT_BASE,
-                                                               iboot_data,
-                                                               iboot_payload);
+                                                               iboot_data + S5L8900_IBOOT_HDR,
+                                                               S5L8900_IBOOT_PAYLOAD);
                                       qemu_log_mask(LOG_UNIMP,
-                                          "s5l8900: loaded decrypted iBoot (%zu bytes) at 0x%x\n",
-                                          iboot_payload, S5L8900_IBOOT_BASE);
+                                          "s5l8900: loaded iBoot payload (0x%zx bytes, Path A) at 0x%x\n",
+                                          S5L8900_IBOOT_PAYLOAD, S5L8900_IBOOT_BASE);
 
-                                      /* Mirror iBoot at original load address (0x18000000).
-                                       * iBoot literal pools reference 0x180xxxxx addresses.
-                                       * Writing to both locations avoids corrupting Thumb
-                                       * code with aggressive address patching. */
+                                      /* Mirror the payload at the runtime load address
+                                       * (0x18000000). Payload base == link base, so iBoot's
+                                       * 0x180xxxxx literal pools resolve correctly. */
                                       cpu_physical_memory_write(S5L8900_USBOTG_BASE,
-                                                               iboot_data,
-                                                               iboot_payload);
-                                      fprintf(stderr, ">>> iBoot: mirrored %zu bytes to 0x%08x\n",
-                                              iboot_payload, S5L8900_USBOTG_BASE);
+                                                               iboot_data + S5L8900_IBOOT_HDR,
+                                                               S5L8900_IBOOT_PAYLOAD);
+                                      fprintf(stderr, ">>> iBoot: mirrored payload 0x%zx bytes to 0x%08x (Path A)\n",
+                                              S5L8900_IBOOT_PAYLOAD, S5L8900_USBOTG_BASE);
 
 
 
@@ -6149,31 +5372,31 @@ static void s5l8900_init(MachineState *machine)
                                      * Better: use pattern 70 47 70 47 (Thumb BX LR repeated).
                                      * ARM reads 0x47704770 = BXEQ r0; BXEQ r0 (no-ops if !Z).
                                      * Thumb reads 0x4770 = BX LR (safe return). */
-                                    {
-                                        size_t fill_sz = S5L8900_IBOOT_SIZE - iboot_payload;
-                                        uint8_t *fill = g_malloc0(fill_sz);
-                                        uint32_t pat = 0x47704770; /* Thumb BX LR x2, ARM BXEQ r0 x2 */
-                                        for (gsize i = 0; i + 4 <= fill_sz; i += 4) {
-                                            memcpy(fill + i, &pat, 4);
-                                        }
-                                         cpu_physical_memory_write(S5L8900_IBOOT_BASE + iboot_payload,
-                                                                   fill, fill_sz);
-                                         /* Also fill the mirror region */
-                                         cpu_physical_memory_write(S5L8900_USBOTG_BASE + iboot_payload,
-                                                                   fill, fill_sz);
-                                         g_free(fill);
-                                         fprintf(stderr, ">>> iBoot: filled 0x%x-0x%x with 0x47704770 pattern\n",
-                                                 (unsigned)(S5L8900_IBOOT_BASE + iboot_payload),
-                                                 (unsigned)(S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE));
-                                     }
+                                     {
+                                         size_t fill_sz = S5L8900_IBOOT_SIZE - S5L8900_IBOOT_PAYLOAD;
+                                         uint8_t *fill = g_malloc0(fill_sz);
+                                         uint32_t pat = 0x47704770; /* Thumb BX LR x2, ARM BXEQ r0 x2 */
+                                         for (gsize i = 0; i + 4 <= fill_sz; i += 4) {
+                                             memcpy(fill + i, &pat, 4);
+                                         }
+                                          cpu_physical_memory_write(S5L8900_IBOOT_BASE + S5L8900_IBOOT_PAYLOAD,
+                                                                    fill, fill_sz);
+                                          /* Also fill the mirror region */
+                                          cpu_physical_memory_write(S5L8900_USBOTG_BASE + S5L8900_IBOOT_PAYLOAD,
+                                                                    fill, fill_sz);
+                                          g_free(fill);
+                                          fprintf(stderr, ">>> iBoot: filled 0x%x-0x%x with 0x47704770 pattern\n",
+                                                  (unsigned)(S5L8900_IBOOT_BASE + S5L8900_IBOOT_PAYLOAD),
+                                                  (unsigned)(S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE));
+                                      }
 
                                     /* Verify iBoot loaded correctly */
                                     {
                                         uint8_t verify[16];
-                                        cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x3ca0, verify, 16);
+                                        cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x38A0, verify, 16);
                                         fprintf(stderr, ">>> iBoot: verify @ 0x3ca0: %02x %02x %02x %02x ...\n",
                                                 verify[0], verify[1], verify[2], verify[3]);
-                                        cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x1ede6, verify, 16);
+                                        cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x1E9E6, verify, 16);
                                         fprintf(stderr, ">>> iBoot: verify @ 0x1ede6: %02x %02x %02x %02x ...\n",
                                                 verify[0], verify[1], verify[2], verify[3]);
                                     }
@@ -6186,7 +5409,7 @@ static void s5l8900_init(MachineState *machine)
                                      * offset 0x0 first (direct payload start).
                                      * Use Thumb bit (LSB=1) for BX to enter Thumb mode. */
                                     {
-                                         uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x400; /* ARM vectors */
+                                         uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x0; /* ARM vectors */
 
                                         // Fix: constant should be at PC+8 when LDR executes.
                                         // LDR is at 0x4980, PC during exec = 0x4984.
@@ -6259,296 +5482,12 @@ static void s5l8900_init(MachineState *machine)
                     }
                 }
 
-               /* CRITICAL: Patch iBSS buffer BEFORE writing to memory.
-                  * The iBSS self-copies from 0x09000000 to 0x22000000.
-                  * By patching the buffer, both the source AND the self-copied
-                  * destination will have the patches. This is essential because
-                  * the self-copy overwrites any patches applied to RAM after load. */
-                  if (s5l8900_ibss_clean()) {
-                      fprintf(stderr, "s5l8900: CLEAN BASELINE - skipping ALL iBSS buffer patches (real image)\n");
-                  } else
-                  {
-                      uint8_t *buf = img_data + IMG2_HDR_SIZE;
-
-                      /* Patch 0x3cdc-0x4fff: fill region with ARM-mode safe return.
-                      * CRITICAL: The iBSS is Thumb-mode code. When executed in ARM mode
-                      * (e.g., via BLX to even address), Thumb bytes decode as ARM LDR/STR
-                      * instructions that read data from PC-relative addresses and use them
-                      * as jump targets, causing PC to jump to 0xe* range garbage addresses.
-                      * Start from 0x3cdc (aligned to 0x3c00) to cover the function that
-                      * crashes at 0x22003cde. Fill through 0x4fff.
-                      * ARM: MOV r0,#1 (0xE3A00001); BX LR (0xE12FFF1E) */
-                      {
-                          /* EXPERIMENT: This fill destroys ~5KB of valid iBSS Thumb
-                           * code (16 real functions, incl. the one at 0x3f4c that the
-                           * crash lands in). It is only correct if iBSS jumps here in
-                           * ARM mode; iBSS is a Thumb binary, so the fill is harmful.
-                           * Gate it behind S5L8900_IBSS_FILL_3C00 (default: SKIP). */
-                          if (getenv("S5L8900_IBSS_FILL_3C00")) {
-                              uint32_t arm_ret[] = { 0xE3A00001, 0xE12FFF1E };
-                              size_t region_start = 0x3c00;
-                              size_t region_size = 0x4400 - region_start; /* Cover 0x3c00 to 0x4fff */
-                              for (size_t i = 0; i < region_size && (region_start + i) < payload_size; i += 8) {
-                                  memcpy(buf + region_start + i, arm_ret, sizeof(arm_ret));
-                              }
-                              fprintf(stderr, "s5l8900: patched iBSS buffer 0x%zx-0x4fff -> ARM MOV r0,#1/BX LR (%zu bytes)\n",
-                                  region_start, region_size);
-                          } else {
-                              fprintf(stderr, "s5l8900: SKIPPED iBSS fill 0x3c00-0x4fff (S5L8900_IBSS_FILL_3C00 unset; real iBSS code preserved)\n");
-                          }
-                      }
-
-                   /* Patch BL callers OUTSIDE the 0x3c00-0x4fff region.
-                     * Only patch callers at 0x5006 and beyond. */
-                     {
-                         uint32_t arm_ret[] = { 0xE3A00001, 0xE12FFF1E };
-                         uint32_t callers[] = { 0x5006, 0x5020, 0x5c66, 0x950e, 0x966c };
-                         for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
-                             if (callers[i] < payload_size) {
-                                 memcpy(buf + callers[i], arm_ret, sizeof(arm_ret));
-                             }
-                         }
-                         fprintf(stderr, "s5l8900: patched iBSS buffer BL callers -> ARM MOV r0,#1/BX LR\n");
-                     }
-
-                    /* Skip iBSS polling loop at 0x3720.
-                     * This loop reads peripheral 0x4c00010 and waits for value > 11.
-                     * The peripheral stub always returns 0, so the loop never exits.
-                     * Replace BLE #-4 (0xD0FC) at offset 0x3724 with NOP (0xBF00). */
-                    if (0x3724 < payload_size) {
-                        uint8_t thumb_nop[] = { 0x00, 0xBF }; /* NOP */
-                        memcpy(buf + 0x3724, thumb_nop, sizeof(thumb_nop));
-                        fprintf(stderr,
-                            "s5l8900: skipped iBSS polling loop at 0x3724 (BLE->NOP)\n");
-                    }
-
-                    /* Patch stuck function at 0x5bf0: Thumb MOV r0,#1; BX LR.
-                     * This function loops and calls functions that return bad addresses,
-                     * causing PC to jump through 0x22* range garbage. */
-                    if (0x5bf0 < payload_size) {
-                        uint8_t thumb_ret[] = { 0x01, 0x20, 0x70, 0x47 }; /* MOV r0,#1; BX LR */
-                        memcpy(buf + 0x5bf0, thumb_ret, sizeof(thumb_ret));
-                        fprintf(stderr,
-                            "s5l8900: patched iBSS stuck func at 0x5bf0 -> MOV r0,#1/BX LR\n");
-                    }
-
-                     /* Patch 0x5400: Thumb MOV r0,#0; BX LR */
-                     {
-                         uint8_t ret_0[] = { 0x00, 0x20, 0x70, 0x47 };
-                         memcpy(buf + 0x5400, ret_0, sizeof(ret_0));
-                     }
-                 }
 
                 cpu_physical_memory_write(S5L8900_IBSS_BASE,
                                             img_data + IMG2_HDR_SIZE,
                                             payload_size);
 
-                 /* Patch iBSS polling loops and exception handlers.
-                  * iBSS self-copies to SRAM (0x22000000) at boot.
-                  * Patch source at 0x09000000 so self-copy propagates patches.
-                  * Write bytes explicitly to avoid host endianness issues. */
-                 if (s5l8900_ibss_clean()) {
-                     fprintf(stderr, "s5l8900: CLEAN BASELINE - skipping iBSS post-write code patches\n");
-                 } else
-                 {
-                     /* 1. CLOCK1 PLL lock poll at offset 0x1154 (Thumb-16).
-                      * Loop: LDR r3,[r2] / TST r1,r3 / BEQ #-4
-                      * Replace BEQ (0xD0FC) with NOP (0xBF00). */
-                     uint8_t ibss_nop[] = { 0x00, 0xBF };
-                    cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x1154,
-                                              ibss_nop, 2);
-                    qemu_log_mask(LOG_UNIMP,
-                        "s5l8900: patched iBSS CLOCK1 poll at 0x%lx (BEQ->NOP)\n",
-                        (unsigned long)(S5L8900_IBSS_BASE + 0x1154));
 
-                    /* 2. Restore corrupted Thumb-32 ADD at offset 0x10540.
-                     * Previous NOP patch (2 bytes) overwrote only the first halfword
-                     * of the 32-bit 'add r0, r0, #1' (0xFA 0xFF 0xFF 0x0A),
-                     * creating a malformed instruction that triggers undefined-instruction
-                     * or prefetch abort. Restore original bytes. */
-                    uint8_t ibss_restore_add[] = { 0xfa, 0xff, 0xff, 0x0a };
-                    cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x10540,
-                                              ibss_restore_add, 4);
-                    qemu_log_mask(LOG_UNIMP,
-                        "s5l8900: restored iBSS ADD at 0x%lx\n",
-                        (unsigned long)(S5L8900_IBSS_BASE + 0x10540));
-
-  /* 3. Prevent fallthrough to zeros at offset 0x10564.
-                       * After the scan loop counter expires (r1=12), the Thumb-32
-                       * B.ne instruction at 0x10564 (0x1EFF 0x2FE1) is not taken,
-                       * and execution falls into zero padding at 0x10568.
-                       * Replace entire Thumb-32 instruction with two NOPs (0xBF00 0xBF00)
-                       * so execution falls through safely. The zeros at 0x10568 decode as
-                       * YIELD hints in Thumb mode, which are harmless no-ops.
-                       * Eventually the catch-all stub handles accesses to unmapped data,
-                       * and the USB init code at 0x10598 writes "config_board" to trigger
-                       * the iBEC redirect. */
-                      uint8_t ibss_loop_patch[] = { 0x00, 0xBF, 0x00, 0xBF }; /* Two Thumb NOPs */
-                      cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x10564,
-                                                ibss_loop_patch, 4);
-                      qemu_log_mask(LOG_UNIMP,
-                          "s5l8900: patched iBSS fallthrough at 0x%lx (two NOPs)\n",
-                          (unsigned long)(S5L8900_IBSS_BASE + 0x10564));
-
-                    /* 3b. Patch stuck iBSS function at 0x10580 that calls bad
-                         * function pointers (0x22010500) and loops in upper RAM.
-                         * The function is called in ARM mode by the caller
-                         * (lr bit[0]=0), so ARM-mode encodings are required.
-                         * Patch with MOV r0,#1; BX LR (ARM) to return success.
-                         * Also patch the two BLX #0x22010500 at 0x10592 and
-                         * 0x105ac as a fallback, in case execution reaches them. */
-                        {
-                            uint8_t ibss_arm_ret[] = {
-                                0x01, 0x00, 0xA0, 0xE3,  /* MOV r0, #1 (ARM) */
-                                0x1E, 0xFF, 0x2F, 0xE1   /* BX LR (ARM, return to Thumb) */
-                            };
-                            cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x10580,
-                                                      ibss_arm_ret, sizeof(ibss_arm_ret));
-                            cpu_physical_memory_write(S5L8900_RAM_BASE + 0x10580,
-                                                      ibss_arm_ret, sizeof(ibss_arm_ret));
-                            /* Fallback: NOP the BLX #0x22010500 calls at 0x10592 and 0x105ac */
-                            uint8_t blx_nop[] = { 0x00, 0xBF, 0x00, 0xBF }; /* Two Thumb NOPs */
-                            cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x10592,
-                                                      blx_nop, sizeof(blx_nop));
-                            cpu_physical_memory_write(S5L8900_RAM_BASE + 0x10592,
-                                                      blx_nop, sizeof(blx_nop));
-                            cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x105ac,
-                                                      blx_nop, sizeof(blx_nop));
-                            cpu_physical_memory_write(S5L8900_RAM_BASE + 0x105ac,
-                                                      blx_nop, sizeof(blx_nop));
-
-                            /* 3c. Patch iBSS linked-list comparison loop at 0x702a.
-                             * The loop at 0x702c-0x7048 iterates a linked list,
-                             * calling 0x104e0 to compare each entry. The comparison
-                             * always fails (hardware-specific data), causing an
-                             * infinite or very long loop. Skip the entire loop by
-                             * redirecting B at 0x702a to the exit at 0x7050.
-                             * Target: 0x7050, Source: 0x702c (PC after B).
-                             * Offset: (0x7050 - 0x702c) / 2 = 0x13.
-                             * Encoding: 0xE000 | 0x13 = 0xE013. */
-                            {
-                                uint8_t skip_loop[] = { 0x13, 0xE0 }; /* B #0x7050 */
-                                cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x702a,
-                                                          skip_loop, sizeof(skip_loop));
-                                cpu_physical_memory_write(S5L8900_RAM_BASE + 0x702a,
-                                                          skip_loop, sizeof(skip_loop));
-                            }
-
-                            /* Also patch 0x6f60 which has the same comparison loop.
-                             * Redirect B at 0x6f70 to the exit at 0x6faa.
-                             * Target: 0x6faa, Source: 0x6f72 (PC after B).
-                             * Offset: (0x6faa - 0x6f72) / 2 = 0x1C.
-                             * Encoding: 0xE000 | 0x1C = 0xE01C. */
-                            {
-                                uint8_t skip_6f60_loop[] = { 0x1C, 0xE0 }; /* B #0x6faa */
-                                cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x6f70,
-                                                          skip_6f60_loop, sizeof(skip_6f60_loop));
-                                cpu_physical_memory_write(S5L8900_RAM_BASE + 0x6f70,
-                                                          skip_6f60_loop, sizeof(skip_6f60_loop));
-                            }
-
-                           /* 3d. Patch the function at 0x4ea0 entirely.
-                              * This function reads bad function pointers from its constant pool
-                              * and jumps to garbage addresses (0xe* range). Replace with
-                              * Thumb infinite loop. Also patch BL callers to skip the call. */
-                             {
-/* Fill 0x4ea0-0x4ebf with Thumb infinite loop */
-                                  uint8_t safe_loop[32];
-                                  for (int i = 0; i < 32; i += 2) {
-                                       safe_loop[i] = 0xFE;  /* B #-4 (0xE7FE) */
-                                       safe_loop[i+1] = 0xE7;
-                                   }
-                                 cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x4ea0,
-                                                           safe_loop, sizeof(safe_loop));
-                                 cpu_physical_memory_write(S5L8900_RAM_BASE + 0x4ea0,
-                                                           safe_loop, sizeof(safe_loop));
-
-                                 /* Patch BL callers: replace with MOV r0,#1; BX LR */
-                                 uint8_t skip_call[] = { 0x01, 0x20, 0x70, 0x47 };
-                                 uint32_t callers[] = {
-                                     0x4eaa, 0x4efb, 0x4fba, 0x5006, 0x5020, 0x5c66, 0x950e, 0x966c
-                                 };
-                                 for (size_t i = 0; i < sizeof(callers) / sizeof(callers[0]); i++) {
-                                     cpu_physical_memory_write(S5L8900_IBSS_BASE + callers[i],
-                                                               skip_call, sizeof(skip_call));
-                                     cpu_physical_memory_write(S5L8900_RAM_BASE + callers[i],
-                                                               skip_call, sizeof(skip_call));
-                                 }
-                             }
-
-                            /* 3e. Also patch 0x5400 entry itself as a fallback. */
-                            {
-                                uint8_t func_5400_safe[] = {
-                                    0x00, 0x20,  /* MOV r0, #0 (Thumb) */
-                                    0x70, 0x47   /* BX LR (Thumb) */
-                                };
-                                cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x5400,
-                                                          func_5400_safe, sizeof(func_5400_safe));
-                            }
-
-                            /* Flush TB cache so patched instructions take effect */
-                            queue_tb_flush(CPU(cpu));
-                            fprintf(stderr,
-                                "s5l8900: patched iBSS stuck func at 0x10580 -> MOV r0,#1; BX LR (ARM)\n");
-                            fprintf(stderr,
-                                "s5l8900: NOPed BLX at 0x10592 and 0x105ac (bad function pointer)\n");
-                            fprintf(stderr,
-                                "s5l8900: skipped iBSS comparison loop at 0x702a -> B exit\n");
-                            fprintf(stderr,
-                                "s5l8900: skipped iBSS 0x6f60 comparison loop -> B exit\n");
-                      fprintf(stderr,
-                                 "s5l8900: NOPed 7 callers of 0x5400 (bad data deref)\n");
-                             fprintf(stderr,
-                                 "s5l8900: patched iBSS func at 0x5400 -> MOV r0,#0; BX LR\n");
-                         }
-                 }
-
-               /* 4. Patch iBSS exception handlers to redirect to iBEC.
-                  * The iBSS sets up its own exception handlers at 0x22004040,
-                  * 0x22004068, and 0x2200408c. Instead of infinite loops,
-                  * redirect to the ARM->Thumb trampoline so we skip to iBEC
-                  * and avoid the undefined-instruction crash in iBSS code.
-                  * Use: LDR pc, [pc, #0] with constant = trampoline address. */
-                  if (!s5l8900_ibss_clean()) {
-                      /* Each handler: LDR pc, [pc, #0]; .word tramp_addr */
-                      uint32_t arm_to_tramp = 0xE59FF000; /* LDR pc, [pc, #0] */
-                       uint32_t tramp_addr = S5L8900_RAM_BASE + 0xF900;
-
-                     /* Undefined Instruction handler at offset 0x4040 */
-                     cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x4040,
-                                               &arm_to_tramp, 4);
-                     cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x4044,
-                                               &tramp_addr, 4);
-                     /* Prefetch Abort handler at offset 0x4068 */
-                     cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x4068,
-                                               &arm_to_tramp, 4);
-                     cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x406C,
-                                               &tramp_addr, 4);
-                     /* Data Abort handler at offset 0x408c */
-                     cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x408c,
-                                               &arm_to_tramp, 4);
-                     cpu_physical_memory_write(S5L8900_IBSS_BASE + 0x4090,
-                                               &tramp_addr, 4);
-
-                     /* Also patch SRAM copies directly. The iBSS self-copies to
-                      * 0x22000000, and its exception handlers may already be set up
-                      * in SRAM at 0x22004040, 0x22004068, 0x2200408c. */
-                     cpu_physical_memory_write(S5L8900_RAM_BASE + 0x4040,
-                                               &arm_to_tramp, 4);
-                     cpu_physical_memory_write(S5L8900_RAM_BASE + 0x4044,
-                                               &tramp_addr, 4);
-                     cpu_physical_memory_write(S5L8900_RAM_BASE + 0x4068,
-                                               &arm_to_tramp, 4);
-                     cpu_physical_memory_write(S5L8900_RAM_BASE + 0x406C,
-                                               &tramp_addr, 4);
-                     cpu_physical_memory_write(S5L8900_RAM_BASE + 0x408c,
-                                               &arm_to_tramp, 4);
-                     cpu_physical_memory_write(S5L8900_RAM_BASE + 0x4090,
-                                               &tramp_addr, 4);
-
-                     qemu_log_mask(LOG_UNIMP,
-                         "s5l8900: patched iBSS exception handlers -> ARM UART loop\n");
-                 }
 
                qemu_log_mask(LOG_UNIMP,
                      "s5l8900: loaded iBSS %s (%zu bytes payload) at 0x%x\n",
@@ -6560,7 +5499,7 @@ static void s5l8900_init(MachineState *machine)
                        * stuck-loop detection to redirect to iBoot.
                        * Must exist before iBSS jumps to iBEC at 0x18000000. */
                   {
-                      uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x400; /* ARM vectors */
+                      uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x0; /* ARM vectors */
                       uint32_t tramp[3] = {
                           0xE59F0000,  /* LDR r0, [pc, #0] */
                           0xE12FFF10,  /* BX r0            -> Thumb mode (LSB=1) */
@@ -6799,22 +5738,23 @@ static void s5l8900_init(MachineState *machine)
                                                 "s5l8900: patched iBoot infinite loop -> UART print stub at 0x510\n");
                                         }
     
-                                          cpu_physical_memory_write(S5L8900_IBOOT_BASE,
-                                                                   iboot_data,
-                                                                   iboot_payload);
-                                          qemu_log_mask(LOG_UNIMP,
-                                              "s5l8900: loaded decrypted iBoot (%zu bytes) at 0x%x\n",
-                                              iboot_payload, S5L8900_IBOOT_BASE);
-    
-                                          /* Mirror iBoot at original load address (0x18000000).
-                                           * iBoot literal pools reference 0x180xxxxx addresses.
-                                           * Writing to both locations avoids corrupting Thumb
-                                           * code with aggressive address patching. */
-                                          cpu_physical_memory_write(S5L8900_USBOTG_BASE,
-                                                                   iboot_data,
-                                                                   iboot_payload);
-                                          fprintf(stderr, ">>> iBoot: mirrored %zu bytes to 0x%08x\n",
-                                                  iboot_payload, S5L8900_USBOTG_BASE);
+                                           /* Path A: write ONLY the payload (skip the 0x400-byte
+                                            * img2 header) so payload base == link base 0x18000000
+                                            * and iBoot's absolute pointers resolve correctly. */
+                                           cpu_physical_memory_write(S5L8900_IBOOT_BASE,
+                                                                    iboot_data + S5L8900_IBOOT_HDR,
+                                                                    S5L8900_IBOOT_PAYLOAD);
+                                           qemu_log_mask(LOG_UNIMP,
+                                               "s5l8900: loaded iBoot payload (0x%zx bytes, Path A) at 0x%x\n",
+                                               S5L8900_IBOOT_PAYLOAD, S5L8900_IBOOT_BASE);
+
+                                           /* Mirror the payload at the runtime load address
+                                            * (0x18000000). Payload base == link base. */
+                                           cpu_physical_memory_write(S5L8900_USBOTG_BASE,
+                                                                    iboot_data + S5L8900_IBOOT_HDR,
+                                                                    S5L8900_IBOOT_PAYLOAD);
+                                           fprintf(stderr, ">>> iBoot: mirrored payload 0x%zx bytes to 0x%08x (Path A)\n",
+                                                   S5L8900_IBOOT_PAYLOAD, S5L8900_USBOTG_BASE);
     
     
     
@@ -6827,31 +5767,31 @@ static void s5l8900_init(MachineState *machine)
                                          * Better: use pattern 70 47 70 47 (Thumb BX LR repeated).
                                          * ARM reads 0x47704770 = BXEQ r0; BXEQ r0 (no-ops if !Z).
                                          * Thumb reads 0x4770 = BX LR (safe return). */
-                                        {
-                                            size_t fill_sz = S5L8900_IBOOT_SIZE - iboot_payload;
-                                            uint8_t *fill = g_malloc0(fill_sz);
-                                            uint32_t pat = 0x47704770; /* Thumb BX LR x2, ARM BXEQ r0 x2 */
-                                            for (gsize i = 0; i + 4 <= fill_sz; i += 4) {
-                                                memcpy(fill + i, &pat, 4);
-                                            }
-                                             cpu_physical_memory_write(S5L8900_IBOOT_BASE + iboot_payload,
-                                                                       fill, fill_sz);
-                                             /* Also fill the mirror region */
-                                             cpu_physical_memory_write(S5L8900_USBOTG_BASE + iboot_payload,
-                                                                       fill, fill_sz);
-                                             g_free(fill);
-                                             fprintf(stderr, ">>> iBoot: filled 0x%x-0x%x with 0x47704770 pattern\n",
-                                                     (unsigned)(S5L8900_IBOOT_BASE + iboot_payload),
-                                                     (unsigned)(S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE));
-                                         }
+                                         {
+                                             size_t fill_sz = S5L8900_IBOOT_SIZE - S5L8900_IBOOT_PAYLOAD;
+                                             uint8_t *fill = g_malloc0(fill_sz);
+                                             uint32_t pat = 0x47704770; /* Thumb BX LR x2, ARM BXEQ r0 x2 */
+                                             for (gsize i = 0; i + 4 <= fill_sz; i += 4) {
+                                                 memcpy(fill + i, &pat, 4);
+                                             }
+                                              cpu_physical_memory_write(S5L8900_IBOOT_BASE + S5L8900_IBOOT_PAYLOAD,
+                                                                        fill, fill_sz);
+                                              /* Also fill the mirror region */
+                                              cpu_physical_memory_write(S5L8900_USBOTG_BASE + S5L8900_IBOOT_PAYLOAD,
+                                                                        fill, fill_sz);
+                                              g_free(fill);
+                                              fprintf(stderr, ">>> iBoot: filled 0x%x-0x%x with 0x47704770 pattern\n",
+                                                      (unsigned)(S5L8900_IBOOT_BASE + S5L8900_IBOOT_PAYLOAD),
+                                                      (unsigned)(S5L8900_IBOOT_BASE + S5L8900_IBOOT_SIZE));
+                                          }
     
                                         /* Verify iBoot loaded correctly */
                                         {
                                             uint8_t verify[16];
-                                            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x3ca0, verify, 16);
+                                            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x38A0, verify, 16);
                                             fprintf(stderr, ">>> iBoot: verify @ 0x3ca0: %02x %02x %02x %02x ...\n",
                                                     verify[0], verify[1], verify[2], verify[3]);
-                                            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x1ede6, verify, 16);
+                                            cpu_physical_memory_read(S5L8900_IBOOT_BASE + 0x1E9E6, verify, 16);
                                             fprintf(stderr, ">>> iBoot: verify @ 0x1ede6: %02x %02x %02x %02x ...\n",
                                                     verify[0], verify[1], verify[2], verify[3]);
                                         }
@@ -6864,7 +5804,7 @@ static void s5l8900_init(MachineState *machine)
                                          * offset 0x0 first (direct payload start).
                                          * Use Thumb bit (LSB=1) for BX to enter Thumb mode. */
                                         {
-                                             uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x400; /* ARM vectors */
+                                             uint32_t iboot_entry = S5L8900_IBOOT_BASE + 0x0; /* ARM vectors */
     
                                             // Fix: constant should be at PC+8 when LDR executes.
                                             // LDR is at 0x4980, PC during exec = 0x4984.
@@ -6954,9 +5894,16 @@ static void s5l8900_init(MachineState *machine)
     /* CLOCK1 stub - stateful PLL lock status for ROM and iBSS */
      MemoryRegion *clock1 = g_new0(MemoryRegion, 1);
      S5L8900ClockState *clock1_state = g_new0(S5L8900ClockState, 1);
-     memory_region_init_io(clock1, NULL, &s5l8900_clock_ops, clock1_state,
-                            "s5l8900.clock1", 0x1000);
-     memory_region_add_subregion(sysmem, 0x3c500000, clock1);
+      memory_region_init_io(clock1, NULL, &s5l8900_clock_ops, clock1_state,
+                             "s5l8900.clock1", 0x1000);
+      memory_region_add_subregion(sysmem, 0x3c500000, clock1);
+
+    /* WMROAM device stub (0x3c900000) - OAM driver with ready-bit poll */
+    MemoryRegion *wmroam = g_new0(MemoryRegion, 1);
+    S5L8900WMROAMState *wmroam_state = g_new0(S5L8900WMROAMState, 1);
+    memory_region_init_io(wmroam, NULL, &s5l8900_wmroam_ops, wmroam_state,
+                           "s5l8900.wmroam", 0x1000);
+    memory_region_add_subregion(sysmem, 0x3c900000, wmroam);
 
     /* VIC0 stub (0x38e00000) - Interrupt controller */
     memory_region_init_io(vic0_mr, NULL, &s5l8900_vic_ops, vic0,
@@ -7074,11 +6021,38 @@ MemoryRegion *unk2 = g_new0(MemoryRegion, 1);
          memory_region_init_io(thhook, NULL, &s5l8900_codehook_ops,
                                (void *)(uintptr_t)0x18002e80,
                                "s5l8900.thhook", 0x80);
-         memory_region_add_subregion_overlap(sysmem, 0x18002e80, thhook, 100);
-         fprintf(stderr, ">>> THUMB HOOK at 0x18002e80-0x18002f00 (Thumb code-region writer tracker)\n");
-     }
+          memory_region_add_subregion_overlap(sysmem, 0x18002e80, thhook, 100);
+          fprintf(stderr, ">>> THUMB HOOK at 0x18002e80-0x18002f00 (Thumb code-region writer tracker)\n");
+      }
 
-    /* USB stub */
+      /* Write-trace windows for the heap conflict (enable with S5L8900_WTRACE=1).
+       * Pure-data windows only; forwarding keeps behaviour identical. */
+      if (getenv("S5L8900_WTRACE")) {
+          s5l8900_wtrace_enabled = 1;
+          s5l8900_tw_sram.win_base = 0x22030000;
+          s5l8900_tw_sram.reg_base = S5L8900_RAM_BASE;
+          s5l8900_tw_sram.host = memory_region_get_ram_ptr(ram);
+          s5l8900_tw_sram.tag = "CMD";
+          {
+              MemoryRegion *m = g_new0(MemoryRegion, 1);
+              memory_region_init_io(m, NULL, &s5l8900_tw_ops, &s5l8900_tw_sram,
+                                    "s5l8900.wtrace_cmd", 0x100);
+              memory_region_add_subregion_overlap(sysmem, 0x22030000, m, 200);
+          }
+          s5l8900_tw_frl.win_base = 0x180236e0;
+          s5l8900_tw_frl.reg_base = S5L8900_USBOTG_BASE;
+          s5l8900_tw_frl.host = usbotg_state->ram;
+          s5l8900_tw_frl.tag = "FRL";
+          {
+              MemoryRegion *m = g_new0(MemoryRegion, 1);
+              memory_region_init_io(m, NULL, &s5l8900_tw_ops, &s5l8900_tw_frl,
+                                    "s5l8900.wtrace_frl", 0x200);
+              memory_region_add_subregion_overlap(sysmem, 0x180236e0, m, 200);
+          }
+          fprintf(stderr, ">>> WTRACE windows installed: CMD 0x22030000-0x22030100, FRL 0x180236e0-0x180238e0 (arm after bulk load)\n");
+      }
+
+     /* USB stub */
     S5L8900USBState *usb_state = g_new0(S5L8900USBState, 1);
     MemoryRegion *usb = g_new0(MemoryRegion, 1);
     memory_region_init_io(usb, NULL, &s5l8900_usb_ops, usb_state,
