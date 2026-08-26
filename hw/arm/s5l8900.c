@@ -71,13 +71,13 @@ static const MemoryRegionOps s5l8900_catchall_ops = {
 };
 
 typedef struct {
-    uint32_t something;
+    uint32_t property;
 } S5L8900WDTState;
 
 static uint64_t s5l8900_wdt_read(void *o, hwaddr off, unsigned size) {
     S5L8900WDTState *s = o;
     if (off == 0) {
-        return s->something;
+        return s->property;
     }
     qemu_log_mask(LOG_UNIMP, "s5l8900.wdt: r%u 0x%08llx\n", size, off);
     return 0;
@@ -86,7 +86,7 @@ static uint64_t s5l8900_wdt_read(void *o, hwaddr off, unsigned size) {
 static void s5l8900_wdt_write(void *o, hwaddr off, uint64_t v, unsigned size) {
     S5L8900WDTState *s = o;
     if (off == 0) {
-        s->something = v;
+        s->property = v;
         return;
     }
     qemu_log_mask(LOG_UNIMP, "s5l8900.wdt: w%u 0x%08llx <= 0x%08x\n", size, off, (unsigned)v);
@@ -95,6 +95,34 @@ static void s5l8900_wdt_write(void *o, hwaddr off, uint64_t v, unsigned size) {
 static const MemoryRegionOps s5l8900_wdt_ops = {
     .read  = s5l8900_wdt_read,
     .write = s5l8900_wdt_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+typedef struct {
+    uint32_t property;
+} S5L8900VICState;
+
+static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
+    S5L8900VICState *s = o;
+    if (off == 0x14) {
+        return s->property;
+    }
+    qemu_log_mask(LOG_UNIMP, "s5l8900.vic: r%u 0x%08llx\n", size, off);
+    return 0;
+}
+
+static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
+    S5L8900VICState *s = o;
+    if (off == 0x14) {
+        s->property = v;
+        return;
+    }
+    qemu_log_mask(LOG_UNIMP, "s5l8900.vic: w%u 0x%08llx <= 0x%08x\n", size, off, (unsigned)v);
+}
+
+static const MemoryRegionOps s5l8900_vic_ops = {
+    .read  = s5l8900_vic_read,
+    .write = s5l8900_vic_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
@@ -113,7 +141,7 @@ static void s5l8900_init(MachineState *machine)
     MemoryRegion *vrom = g_new0(MemoryRegion, 1);
     memory_region_init_ram(vrom, NULL, "s5l8900.vrom", S5L8900_VROM_SIZE, &error_fatal);
     memory_region_set_readonly(vrom, true);
-    memory_region_add_subregion(sysmem, S5L8900_VROM_BASE, vrom);
+    memory_region_add_subregion_overlap(sysmem, S5L8900_VROM_BASE, vrom, 1);
 
     // evec
     MemoryRegion *evec = g_new0(MemoryRegion, 1);
@@ -125,6 +153,12 @@ static void s5l8900_init(MachineState *machine)
     S5L8900WDTState *wdt_state = g_new0(S5L8900WDTState, 1);
     memory_region_init_io(wdt, NULL, &s5l8900_wdt_ops, wdt_state, "s5l8900.wdt", 0x1000);
     memory_region_add_subregion_overlap(sysmem, S5L8900_WDT_BASE, wdt, 1);
+
+    // vic0
+    MemoryRegion *vic0 = g_new0(MemoryRegion, 1);
+    S5L8900VICState *vic0_state = g_new0(S5L8900VICState, 1);
+    memory_region_init_io(vic0, NULL, &s5l8900_vic_ops, vic0_state, "s5l8900.vic0", 0x1000);
+    memory_region_add_subregion_overlap(sysmem, S5L8900_VIC0_BASE, vic0, 1);
 
     if (machine->firmware) {
         if (rom_add_file_fixed(machine->firmware, S5L8900_VROM_BASE, -1) < 0) {
