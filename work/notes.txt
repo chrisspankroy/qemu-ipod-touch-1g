@@ -1,27 +1,38 @@
-iPod Touch (1st-generation)
-n45ap
+SecureROM:
 
-You have a 8GB model. Uses 2 NAND chips of 4GB each
+Base address - 0x20000000
+Raw, no header or encapsulation
 
-Supports iOS 1.1-3.1.3
+ARM:
+r0-r15 are general purpose registers where
 
-S5L8900
-CPU datasheet: https://developer.arm.com/documentation/ddi0301/h/
+r13 == sp == stack pointer
+r14 == lr == link register/return address
+r15 == pc == program counter
 
-No SHSH blobs or downgrade protection
+r0-r3 are function args. Function return value goes in r0
+r4-r11 and sp are callee-saved
+r0-r3 and r12 are scratch
 
-Peripheral port at 0x38000000 (this is where all the peripheral memory ranges fall into)
+A push involving lr is probably the start of a function (and vice versa)
+
+CPSR is the mode register, it encodes current flags and interrupt masks and processor mode
+Bit map:
+31-28    N Z C V     condition flags
+...      Not as important, look up if needed
+7        I           IRQ masked
+6        F           FIQ masked
+5        T           Thumb mode
+4-0      mode        CPU mode, USR - 0x10, FIQ - 0x11, IRQ - 0x12, SVC - 0x13, ABT - 0x17, UND - 0x1b
+
+You have custom `cpsr` command in qemu to print state
+
+CP15 is the control plane register which is where MMU and caches live
+
+ARM vs Thumb:
+Arm has 32-bit instructions, so PC is always 4-byte aligned
+Thumb has 16-bit instructions, so PC can be 2-byte aligned
+GDB decodes using the current T bit value, so you might see garbage
 
 Memory map:
-SecureROM (VROM): 0x20000000-0x20010000
-CLOCK0: 0x38100000
-VIC0: 0x38e00000-0x38e00fff
-VIC1: 0x38e01000-0x38e01fff
-EDGEIC: 0x38e02000
-GPIOIC: 0x39a00000
-CLOCK1: 0x3c500000
-WDT_CTRL: 0x3e300000
-
-DFU mode is in the SecureROM
-
-SecureROM dumps at securerom.fun
+WDT_CTRL - 0x3e300000
