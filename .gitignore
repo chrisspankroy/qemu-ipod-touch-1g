@@ -22,3 +22,4 @@ GTAGS
 *.gcov
 work/backup_files
 work/iPod1,1_1.1_3A101a_Restore.ipsw
+.DS_Store
