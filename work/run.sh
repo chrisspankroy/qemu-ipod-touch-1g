@@ -48,8 +48,9 @@ done
 
 echo "==> Attaching GDB (Ctrl-D or 'quit' to exit GDB, then QEMU stops too)"
 gdb \
-    -ex "set architecture arm" \
-    -ex "target remote :$GDB_PORT" \
-    -ex "set pagination off"
-
+     -ex "set architecture arm" \
+     -ex "set pagination off" \
+     -ex "layout split" \
+     -ex "tui reg general" \
+     -ex "target remote :$GDB_PORT"
 kill $QEMU_PID 2>/dev/null || true
