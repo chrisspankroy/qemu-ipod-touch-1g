@@ -98,26 +98,242 @@ static const MemoryRegionOps s5l8900_wdt_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+// S5L8900 uses the PL192 VIC, docs are here https://support.arm.com/documentation/ddi0273/a
+
+// Shows the status of the interrupts after masking by the VICINTENABLE and VICINTSELECT Registers
+// ro
+#define VIC_IRQSTATUS            0x0
+// Shows the status of the FIQ interrupts after masking by the VICINTENABLE and VICINTSELECT Registers
+// ro
+#define VIC_FIQSTATUS            0x4
+// Shows the status of the interrupts before masking by the Enable Registers
+// ro
+#define VIC_RAWINTR              0x8
+// Shows type of interrupt for interrupt request (0 = IRQ, 1 = FIQ)
+// rw
+#define VIC_INTSELECT            0xc
+// Enables the interrupt request lines, which allow the interrupts to reach the processor
+// You can only enable interrupts with this register. Use VICINTENCLEAR to disable
+// 0 = disabled, 1 = enabled
+// rw
+#define VIC_INTENABLE            0x10
+// Clears corresponding bits in the VICINTENABLE Register (write-only; 0 = no effect, 1 = disable in VICINTENABLE)
+// wo
+#define VIC_INTENCLEAR           0x14
+// Enable software interrupt
+// read: 0 = no software interrupt, 1 = software interrupt active
+// write: 0 = no effect, 1 = software interrupt enabled
+// rw
+#define VIC_SOFTINT              0x18
+// Clears corresponding bits in the VICSOFTINT Register (write-only; 0 = no effect, 1 = disable in VICSOFTINT)
+// wo
+#define VIC_SOFTINTCLEAR         0x1c
+// Enables or disables protected register access, stopping register accesses when the processor is in User mode
+// only bit 0 is used. 0 = no protection mode, 1 = protection mode enabled
+// rw
+#define VIC_PROTECTION           0x20
+// Contains the software mask value for the interrupt priority levels
+// Only bits [0:15] are used. 0 = masked, 1 = not masked
+// There are 15 priority levels, this controls if that priority should be masked or not
+// rw
+#define VIC_SWPRIORITYMASK       0x24
+// I'm not sure what the docs are for this one
+// rw
+#define VIC_PRIORITYDAISY        0x28
+// Contains the ISR vector addresses
+// First at 0x100, Last at 0x17c
+// rw
+#define VIC_VECTADDR_BEGIN       0x100
+#define VIC_VECTADDR_END         0x17c
+// Select the interrupt priority level for the 32 vectored interrupt sources
+// The value can be from 0-15
+// Default is priority 15 (lowest)
+// If priority match happens to 2 active interrupts, the lowest-numbered interrupt gets priority
+// rw
+#define VIC_VECTPRIORITY_BEGIN   0x200
+#define VIC_VECTPRIORITY_END     0x27c
+// Contains the Interrupt Service Routine (ISR) address of the currently active interrupt
+// If no interrupt is currently active, the register holds the ISR address of the last active interrupt
+// A write of any value to this register clears the current interrupt
+// rw
+#define VIC_ADDRESS              0xf00
+// The PERIPHID registers are weird
+// They are 4 separate 8-bit registers that should be interpreted as a single 32-bit register
+// Part number is bits [11:0]. This identifies the peripheral. The three digit product code 0x192 is used for the PrimeCell VIC.
+// Designer is bits [19:12]. This is the identification of the designer. ARM Limited is 0x41 (ASCII A).
+// Revision number is bits [23:20]. This is the revision number of the peripheral. The revision number starts from 0 and the value is revision-dependent.
+// Configuration is bits [31:24]. This is the configuration option of the peripheral. The configuration value is 0.
+// Using a 0 revision and 0 configuration value, that results in a bit string of 00000000000001000001000110010010
+// Splitting that into 4 8-bit registers: 00000000 00000100 00010001 10010010
+// All 4 are ro
+// bits [0-7] == 10010010 == 146 == 0x92
+#define VIC_PERIPHID0             0xfe0
+// bits [8-15] == 00010001 == 17 == 0x11
+#define VIC_PERIPHID1             0xfe4
+// bits [16-23] == 00000100 == 4 == 0x4
+#define VIC_PERIPHID2             0xfe8
+// bits [24-31] == 00000000 == 0 == 0x0
+#define VIC_PERIPHID3             0xfec
+// The PCELLID registers are similar to the PERIPHID registers but stay with 8-bit values so they are clearer
+// All 4 are ro
+// bits [0-7] == 0xd
+#define VIC_PCELLID0              0xff0
+// bits [8-15] == 0xf0
+#define VIC_PCELLID1              0xff4
+// bits [16-23] == 0x5
+#define VIC_PCELLID2              0xff8
+// bits [24-31] == 0xb1
+#define VIC_PCELLID3              0xffc
+
 typedef struct {
-    uint32_t property;
+    uint32_t rawintr;
+    uint32_t intselect;
+    uint32_t intenable;
+    uint32_t softint;
+    uint32_t protection;
+    uint32_t swprioritymask;
+    uint32_t prioritydaisy;
+    uint32_t vectaddr[32];
+    uint32_t vectpriority[32];
+    uint32_t vicaddress;
 } S5L8900VICState;
 
 static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
     S5L8900VICState *s = o;
-    if (off == 0x14) {
-        return s->property;
+
+    switch(off) {
+        case VIC_IRQSTATUS:
+            return (s->active & s->intenable) ^ s->intselect;
+        case VIC_FIQSTATUS: 
+            return (s->active & s->intenable) & s->intselect;
+        case VIC_RAWINTR:
+            return s->rawintr;
+        case VIC_INTSELECT:
+            return s->intselect;
+        case VIC_INTENABLE:
+            return s->intenable;
+        case VIC_SOFTINT:
+            return s->softint;
+        case VIC_PROTECTION:
+            return s->protection;
+        case VIC_SWPRIORITYMASK:
+            return s->swprioritymask;
+        case VIC_PRIORITYDAISY:
+            return s->prioritydaisy;
+        case VIC_VECTADDR_BEGIN ... VIC_VECTADDR_END:
+            return s->vectaddr[(off - VIC_VECTADDR_BEGIN) / 4];
+        case VIC_VECTPRIORITY_BEGIN ... VIC_VECTPRIORITY_END:
+            return s->vectpriority[(off - VIC_VECTPRIORITY_BEGIN) / 4];
+        case VIC_ADDRESS:
+            if (s->rawintr == 0) {
+                // No active interrupts, this read is undefined behavior. Do anything you want
+                return s->vectaddr[0];
+            }
+            // You need to find the highest-priority interrupt (closer to 0 is higher priority), with the lowest-indexed interrupt as the tiebreaker
+            int highest_priority_idx = 31;
+            int highest_priority = 0xf;
+            for (int i = 31; i >= 0; i--) {
+                if (s->rawintr & (1u << i)) {
+                    if (s->vectpriority[i] <= highest_priority) {
+                        highest_priority_idx = i;
+                        highest_priority = vectpriority[i];
+                    }
+                }
+            }
+            return s->vectaddr[highest_priority_idx];
+        case VIC_PERIPHID0:
+            return 0x92;
+        case VIC_PERIPHID1:
+            return 0x11;
+        case VIC_PERIPHID2:
+            return 0x4;
+        case VIC_PERIPHID3:
+            return 0;
+        case VIC_PCELLID0:
+            return 0xd;
+        case VIC_PCELLID1:
+            return 0xf0;
+        case VIC_PCELLID2:
+            return 0x5;
+        case VIC_PCELLID3:
+            return 0xb1;
+        default:
+            qemu_log_mask(LOG_UNIMP, "s5l8900.vic: r%u 0x%08llx\n", size, off);
+            return 0;
     }
-    qemu_log_mask(LOG_UNIMP, "s5l8900.vic: r%u 0x%08llx\n", size, off);
-    return 0;
 }
 
 static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
     S5L8900VICState *s = o;
-    if (off == 0x14) {
-        s->property = v;
-        return;
+
+    switch(off) {
+        case VIC_INTSELECT:
+            s->intselect = v;
+            return;
+        case VIC_INTENABLE:
+            // Writes of 0 value should have no effect
+            s->intenable |= v;
+            return;
+        case VIC_INTENCLEAR:
+            // Writes of 0 value should have no effect
+            for (int i = 0; i < 32; i++) {
+                if (s->intenable & (1u << i)) {
+                    s->intenable ^= (1u << 1);
+                }
+            }
+            return; 
+        case VIC_SOFTINT:
+            // Writes of 0 value should have no effect
+            s->softint |= v;
+            return;
+        case VIC_SOFTINTCLEAR:
+            // Writes of 0 value should have no effect
+            for (int i = 0; i < 32; i++) {
+                if (s->softint & (1u << i)) {
+                    s->softint ^= (1u << 1);
+                }
+            }
+            return;
+        case VIC_PROTECTION:
+            s->protection = v;
+            return;
+        case VIC_SWPRIORITYMASK:
+            s->swprioritymask = v;
+            return;
+        case VIC_PRIORITYDAISY:
+            // I dunno what to do with this the docs arent very clear
+            qemu_log_mask(LOG_UNIMP, "s5l8900.vic: r%u 0x%08llx\n", size, off);
+            return;
+        case VIC_VECTADDR_BEGIN ... VIC_VECTADDR_END:
+            s->vectaddr[(off - VIC_VECTADDR_BEGIN) / 4] = v;
+            return;
+        case VIC_VECTPRIORITY_BEGIN ... VIC_VECTPRIORITY_END:
+            s->vectpriority[(off - VIC_VECTPRIORITY_BEGIN) / 4] = v;
+            return; 
+        case VIC_ADDRESS:
+            // It doesn't matter what the write value is
+            // Any write just clears the current interrupt
+            if (s->rawintr == 0) {
+                // No active interrupts, this write is undefined behavior. Do anything you want
+                return;
+            }
+            // You need to find the highest-priority interrupt (closer to 0 is higher priority), with the lowest-indexed interrupt as the tiebreaker. This is the active interrupt
+            int highest_priority_idx = 31;
+            int highest_priority = 0xf;
+            for (int i = 31; i >= 0; i--) {
+                if (s->rawintr & (1u << i)) {
+                    if (s->vectpriority[i] <= highest_priority) {
+                        highest_priority_idx = i;
+                        highest_priority = vectpriority[i];
+                    }
+                }
+            }
+            s->rawintr ^= (1u << highest_priority_idx);
+            return;
+        default:
+            qemu_log_mask(LOG_UNIMP, "s5l8900.vic: w%u 0x%08llx <= 0x%08x\n", size, off, (unsigned)v);
+            return;
     }
-    qemu_log_mask(LOG_UNIMP, "s5l8900.vic: w%u 0x%08llx <= 0x%08x\n", size, off, (unsigned)v);
 }
 
 static const MemoryRegionOps s5l8900_vic_ops = {
@@ -159,6 +375,12 @@ static void s5l8900_init(MachineState *machine)
     S5L8900VICState *vic0_state = g_new0(S5L8900VICState, 1);
     memory_region_init_io(vic0, NULL, &s5l8900_vic_ops, vic0_state, "s5l8900.vic0", 0x1000);
     memory_region_add_subregion_overlap(sysmem, S5L8900_VIC0_BASE, vic0, 1);
+
+    // vic1
+    MemoryRegion *vic1 = g_new0(MemoryRegion, 1);
+    S5L8900VICState *vic1_state = g_new0(S5L8900VICState, 1);
+    memory_region_init_io(vic1, NULL, &s5l8900_vic_ops, vic1_state, "s5l8900.vic1", 0x1000);
+    memory_region_add_subregion_overlap(sysmem, S5L8900_VIC1_BASE, vic1, 1);
 
     if (machine->firmware) {
         if (rom_add_file_fixed(machine->firmware, S5L8900_VROM_BASE, -1) < 0) {
