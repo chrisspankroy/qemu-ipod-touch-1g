@@ -253,7 +253,7 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
             int highest_priority_idx = 31;
             int highest_priority = 0xf;
             for (int i = 31; i >= 0; i--) {
-                if (s->rawintr & (1u << i)) {
+                if (((s->rawintr | s->softint) & s->intenable & ~s->intselect) & (1u << i)) {
                     if (s->vectpriority[i] <= highest_priority) {
                         highest_priority_idx = i;
                         highest_priority = s->vectpriority[i];
