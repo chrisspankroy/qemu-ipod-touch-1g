@@ -203,9 +203,9 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
 
     switch(off) {
         case VIC_IRQSTATUS:
-            return (s->active & s->intenable) ^ s->intselect;
+            return (s->rawintr & s->intenable) ^ s->intselect;
         case VIC_FIQSTATUS: 
-            return (s->active & s->intenable) & s->intselect;
+            return (s->rawintr & s->intenable) & s->intselect;
         case VIC_RAWINTR:
             return s->rawintr;
         case VIC_INTSELECT:
@@ -236,7 +236,7 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
                 if (s->rawintr & (1u << i)) {
                     if (s->vectpriority[i] <= highest_priority) {
                         highest_priority_idx = i;
-                        highest_priority = vectpriority[i];
+                        highest_priority = s->vectpriority[i];
                     }
                 }
             }
@@ -324,7 +324,7 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
                 if (s->rawintr & (1u << i)) {
                     if (s->vectpriority[i] <= highest_priority) {
                         highest_priority_idx = i;
-                        highest_priority = vectpriority[i];
+                        highest_priority = s->vectpriority[i];
                     }
                 }
             }
