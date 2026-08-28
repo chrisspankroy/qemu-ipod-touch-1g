@@ -250,15 +250,19 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
                 return s->lastactive;
             }
             // You need to find the highest-priority interrupt (closer to 0 is higher priority), with the lowest-indexed interrupt as the tiebreaker
-            int highest_priority_idx = 31;
+            int highest_priority_idx = -1;
             int highest_priority = 0xf;
             for (int i = 31; i >= 0; i--) {
-                if (((s->rawintr | s->softint) & s->intenable & ~s->intselect) & (1u << i)) {
+                if (((s->rawintr | s->softint) & s->intenable & ~s->intselect) & (1u << i) && (s->swprioritymask & (1u << s->vectpriority[i]))) {
                     if (s->vectpriority[i] <= highest_priority) {
                         highest_priority_idx = i;
                         highest_priority = s->vectpriority[i];
                     }
                 }
+            }
+            if (highest_priority_idx == -1) {
+                // All active interrupts are software masked. Return last active
+                return s->lastactive;
             }
             s->lastactive = s->vectaddr[highest_priority_idx];
             return s->vectaddr[highest_priority_idx];
@@ -311,16 +315,16 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
             s->protection = v;
             return;
         case VIC_SWPRIORITYMASK:
-            s->swprioritymask = v;
+            s->swprioritymask = v & 0xffff;
             return;
         case VIC_PRIORITYDAISY:
-            s->prioritydaisy = v;
+            s->prioritydaisy = v & 0xf;
             return;
         case VIC_VECTADDR_BEGIN ... VIC_VECTADDR_END:
             s->vectaddr[(off - VIC_VECTADDR_BEGIN) / 4] = v;
             return;
         case VIC_VECTPRIORITY_BEGIN ... VIC_VECTPRIORITY_END:
-            s->vectpriority[(off - VIC_VECTPRIORITY_BEGIN) / 4] = v;
+            s->vectpriority[(off - VIC_VECTPRIORITY_BEGIN) / 4] = v & 0xf;
             return; 
         case VIC_ADDRESS:
             // A full implementation would mask lower-priority interrupts while an interrupt is being serviced (after a VIC_ADDRESS read)
