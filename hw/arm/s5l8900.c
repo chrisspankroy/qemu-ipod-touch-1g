@@ -245,10 +245,6 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
         case VIC_VECTPRIORITY_BEGIN ... VIC_VECTPRIORITY_END:
             return s->vectpriority[(off - VIC_VECTPRIORITY_BEGIN) / 4];
         case VIC_ADDRESS:
-            if (s->rawintr == 0) {
-                // No active interrupts, this read is undefined behavior. Do anything you want
-                return s->lastactive;
-            }
             // You need to find the highest-priority interrupt (closer to 0 is higher priority), with the lowest-indexed interrupt as the tiebreaker
             int highest_priority_idx = -1;
             int highest_priority = 0xf;
