@@ -100,25 +100,6 @@ static const MemoryRegionOps s5l8900_wdt_ops = {
 
 // S5L8900 uses the PL192 VIC, docs are here https://support.arm.com/documentation/ddi0273/a
 
-static void s5l8900_vic_reset(void *opaque)
-{
-    S5L8900VICState *s = o;
-    
-    s->rawintr = 0;
-    s->intselect = 0;
-    s->intenable = 0;
-    s->softint = 0;
-    s->protection = 0;
-    s->swprioritymask = 0xffff;
-    s->prioritydaisy = 0xf;
-    for (int i = 0; i < 32; i++) {
-        s->vectaddr[i] = 0;
-    }
-    for (int i = 0; i < 32; i++) {
-        s->vectpriority[i] = 0xf;
-    }
-}
-
 // Shows the status of the interrupts after masking by the VICINTENABLE and VICINTSELECT Registers
 // ro
 #define VIC_IRQSTATUS            0x0
@@ -214,7 +195,28 @@ typedef struct {
     uint32_t prioritydaisy;
     uint32_t vectaddr[32];
     uint32_t vectpriority[32];
+    uint32_t lastactive;
 } S5L8900VICState;
+
+static void s5l8900_vic_reset(void *opaque)
+{
+    S5L8900VICState *s = opaque;
+    
+    s->rawintr = 0;
+    s->intselect = 0;
+    s->intenable = 0;
+    s->softint = 0;
+    s->protection = 0;
+    s->swprioritymask = 0xffff;
+    s->prioritydaisy = 0xf;
+    for (int i = 0; i < 32; i++) {
+        s->vectaddr[i] = 0;
+    }
+    for (int i = 0; i < 32; i++) {
+        s->vectpriority[i] = 0xf;
+    }
+    s->lastactive = 0;
+}
 
 static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
     S5L8900VICState *s = o;
@@ -245,7 +247,7 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
         case VIC_ADDRESS:
             if (s->rawintr == 0) {
                 // No active interrupts, this read is undefined behavior. Do anything you want
-                return s->vectaddr[0];
+                return s->lastactive;
             }
             // You need to find the highest-priority interrupt (closer to 0 is higher priority), with the lowest-indexed interrupt as the tiebreaker
             int highest_priority_idx = 31;
@@ -258,6 +260,7 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
                     }
                 }
             }
+            s->lastactive = s->vectaddr[highest_priority_idx];
             return s->vectaddr[highest_priority_idx];
         case VIC_PERIPHID0:
             return 0x92;
