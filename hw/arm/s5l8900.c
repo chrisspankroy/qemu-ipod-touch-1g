@@ -137,7 +137,7 @@ static const MemoryRegionOps s5l8900_wdt_ops = {
 // There are 15 priority levels, this controls if that priority should be masked or not
 // rw
 #define VIC_SWPRIORITYMASK       0x24
-// I'm not sure what the docs are for this one
+// Sets the priority of the daisy-chained VIC's interrupts
 // rw
 #define VIC_PRIORITYDAISY        0x28
 // Contains the ISR vector addresses
@@ -195,7 +195,6 @@ typedef struct {
     uint32_t prioritydaisy;
     uint32_t vectaddr[32];
     uint32_t vectpriority[32];
-    uint32_t vicaddress;
 } S5L8900VICState;
 
 static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
@@ -203,9 +202,9 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
 
     switch(off) {
         case VIC_IRQSTATUS:
-            return (s->rawintr & s->intenable) ^ s->intselect;
+            return ((s->rawintr | s->softint) & s->intenable) & ~s->intselect;
         case VIC_FIQSTATUS: 
-            return (s->rawintr & s->intenable) & s->intselect;
+            return ((s->rawintr | s->softint) & s->intenable) & s->intselect;
         case VIC_RAWINTR:
             return s->rawintr;
         case VIC_INTSELECT:
@@ -276,11 +275,7 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
             return;
         case VIC_INTENCLEAR:
             // Writes of 0 value should have no effect
-            for (int i = 0; i < 32; i++) {
-                if (s->intenable & (1u << i)) {
-                    s->intenable ^= (1u << 1);
-                }
-            }
+            s->intenable &= ~v;
             return; 
         case VIC_SOFTINT:
             // Writes of 0 value should have no effect
@@ -288,11 +283,7 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
             return;
         case VIC_SOFTINTCLEAR:
             // Writes of 0 value should have no effect
-            for (int i = 0; i < 32; i++) {
-                if (s->softint & (1u << i)) {
-                    s->softint ^= (1u << 1);
-                }
-            }
+            s->softint &= v;
             return;
         case VIC_PROTECTION:
             s->protection = v;
