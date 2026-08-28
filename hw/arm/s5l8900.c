@@ -100,6 +100,25 @@ static const MemoryRegionOps s5l8900_wdt_ops = {
 
 // S5L8900 uses the PL192 VIC, docs are here https://support.arm.com/documentation/ddi0273/a
 
+static void s5l8900_vic_reset(void *opaque)
+{
+    S5L8900VICState *s = o;
+    
+    s->rawintr = 0;
+    s->intselect = 0;
+    s->intenable = 0;
+    s->softint = 0;
+    s->protection = 0;
+    s->swprioritymask = 0xffff;
+    s->prioritydaisy = 0xf;
+    for (int i = 0; i < 32; i++) {
+        s->vectaddr[i] = 0;
+    }
+    for (int i = 0; i < 32; i++) {
+        s->vectpriority[i] = 0xf;
+    }
+}
+
 // Shows the status of the interrupts after masking by the VICINTENABLE and VICINTSELECT Registers
 // ro
 #define VIC_IRQSTATUS            0x0
@@ -206,7 +225,7 @@ static uint64_t s5l8900_vic_read(void *o, hwaddr off, unsigned size) {
         case VIC_FIQSTATUS: 
             return ((s->rawintr | s->softint) & s->intenable) & s->intselect;
         case VIC_RAWINTR:
-            return s->rawintr;
+            return s->rawintr | s->softint;
         case VIC_INTSELECT:
             return s->intselect;
         case VIC_INTENABLE:
@@ -283,7 +302,7 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
             return;
         case VIC_SOFTINTCLEAR:
             // Writes of 0 value should have no effect
-            s->softint &= v;
+            s->softint &= ~v;
             return;
         case VIC_PROTECTION:
             s->protection = v;
@@ -292,8 +311,7 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
             s->swprioritymask = v;
             return;
         case VIC_PRIORITYDAISY:
-            // I dunno what to do with this the docs arent very clear
-            qemu_log_mask(LOG_UNIMP, "s5l8900.vic: r%u 0x%08llx\n", size, off);
+            s->prioritydaisy = v;
             return;
         case VIC_VECTADDR_BEGIN ... VIC_VECTADDR_END:
             s->vectaddr[(off - VIC_VECTADDR_BEGIN) / 4] = v;
@@ -302,24 +320,9 @@ static void s5l8900_vic_write(void *o, hwaddr off, uint64_t v, unsigned size) {
             s->vectpriority[(off - VIC_VECTPRIORITY_BEGIN) / 4] = v;
             return; 
         case VIC_ADDRESS:
-            // It doesn't matter what the write value is
-            // Any write just clears the current interrupt
-            if (s->rawintr == 0) {
-                // No active interrupts, this write is undefined behavior. Do anything you want
-                return;
-            }
-            // You need to find the highest-priority interrupt (closer to 0 is higher priority), with the lowest-indexed interrupt as the tiebreaker. This is the active interrupt
-            int highest_priority_idx = 31;
-            int highest_priority = 0xf;
-            for (int i = 31; i >= 0; i--) {
-                if (s->rawintr & (1u << i)) {
-                    if (s->vectpriority[i] <= highest_priority) {
-                        highest_priority_idx = i;
-                        highest_priority = s->vectpriority[i];
-                    }
-                }
-            }
-            s->rawintr ^= (1u << highest_priority_idx);
+            // A full implementation would mask lower-priority interrupts while an interrupt is being serviced (after a VIC_ADDRESS read)
+            // In that context, a write here would remove that mask
+            // But for now we don't do that since we dont need to
             return;
         default:
             qemu_log_mask(LOG_UNIMP, "s5l8900.vic: w%u 0x%08llx <= 0x%08x\n", size, off, (unsigned)v);
@@ -366,12 +369,14 @@ static void s5l8900_init(MachineState *machine)
     S5L8900VICState *vic0_state = g_new0(S5L8900VICState, 1);
     memory_region_init_io(vic0, NULL, &s5l8900_vic_ops, vic0_state, "s5l8900.vic0", 0x1000);
     memory_region_add_subregion_overlap(sysmem, S5L8900_VIC0_BASE, vic0, 1);
+    qemu_register_reset(s5l8900_vic_reset, vic0_state);
 
     // vic1
     MemoryRegion *vic1 = g_new0(MemoryRegion, 1);
     S5L8900VICState *vic1_state = g_new0(S5L8900VICState, 1);
     memory_region_init_io(vic1, NULL, &s5l8900_vic_ops, vic1_state, "s5l8900.vic1", 0x1000);
     memory_region_add_subregion_overlap(sysmem, S5L8900_VIC1_BASE, vic1, 1);
+    qemu_register_reset(s5l8900_vic_reset, vic1_state);
 
     if (machine->firmware) {
         if (rom_add_file_fixed(machine->firmware, S5L8900_VROM_BASE, -1) < 0) {
